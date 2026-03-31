@@ -1321,7 +1321,10 @@ def _build_half_time_segment(segment):
 def _build_breath_silence_envelope(segment, sr, gain):
     segment = np.asarray(segment, dtype=np.float32)
     sample_count = segment.shape[0] if segment.ndim > 1 else len(segment)
-    envelope = np.zeros(sample_count, dtype=np.float32)
+    center_gain = float(np.clip(gain, 0.0, 1.0))
+    if center_gain <= 0.035:
+        center_gain = 0.0
+    envelope = np.full(sample_count, center_gain, dtype=np.float32)
     if sample_count == 0:
         return envelope
 
@@ -1332,18 +1335,20 @@ def _build_breath_silence_envelope(segment, sr, gain):
     right_feather_len = min(right_feather_len, overlap_guard)
 
     if left_feather_len > 1:
-        left_curve = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, left_feather_len, dtype=np.float32))
+        left_mix = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, left_feather_len, dtype=np.float32))
+        left_curve = center_gain + (1.0 - center_gain) * left_mix
         envelope[:left_feather_len] = np.maximum(envelope[:left_feather_len], left_curve)
     else:
         envelope[0] = 1.0
 
     if right_feather_len > 1:
-        right_curve = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, right_feather_len, dtype=np.float32))
+        right_mix = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, right_feather_len, dtype=np.float32))
+        right_curve = center_gain + (1.0 - center_gain) * right_mix
         envelope[-right_feather_len:] = np.maximum(envelope[-right_feather_len:], right_curve)
     else:
         envelope[-1] = 1.0
 
-    return np.clip(envelope * max(gain, 0.0), 0.0, 1.0)
+    return np.clip(envelope, 0.0, 1.0)
 
 
 def _build_processed_segment(segment, sr, gain, half_time=False):
@@ -1937,6 +1942,11 @@ class BreathReducerApp:
             messagebox.showwarning("提示", "请先选择音频文件")
             return
 
+        previous_selected_time = float(self.selected_time_sec) if self.selected_time_sec is not None else None
+        previous_view_start = float(self.current_view_start)
+        previous_view_duration = float(self.current_view_duration)
+        previous_active_plot = self.active_plot
+
         self._stop_player()
         self.source_playhead_line = None
         self.output_playhead_line = None
@@ -2006,8 +2016,19 @@ class BreathReducerApp:
         self.drag_plot_kind = None
         self.range_edit_mode = None
         total_duration = len(self.source_audio) / self.sr if self.source_audio is not None else 0.0
-        self.current_view_start = 0.0
-        self.current_view_duration = min(8.0, total_duration) if total_duration else 8.0
+        self.current_view_duration = min(previous_view_duration, total_duration) if total_duration else previous_view_duration
+        if total_duration:
+            view_duration = min(max(0.8, self.current_view_duration), total_duration)
+            max_start = max(0.0, total_duration - view_duration)
+            self.current_view_duration = view_duration
+            self.current_view_start = min(max(previous_view_start, 0.0), max_start)
+            if previous_selected_time is not None:
+                self.selected_time_sec = min(max(previous_selected_time, 0.0), total_duration)
+        else:
+            self.current_view_start = 0.0
+            self.current_view_duration = previous_view_duration
+            self.selected_time_sec = previous_selected_time
+        self.active_plot = previous_active_plot
 
         self.debug_text.set(_format_diagnostics_text(self.last_diagnostics, len(self.segments)))
         self._save_current_config()
