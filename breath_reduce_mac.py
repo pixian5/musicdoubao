@@ -1230,7 +1230,7 @@ class BreathReducerApp:
         top = ttk.Frame(self.root, padding=12)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="选择清唱音频：").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="选择音频文件：").grid(row=0, column=0, sticky="w")
         self.file_label = ttk.Label(top, text="未选择文件", foreground="gray")
         self.file_label.grid(row=0, column=1, sticky="w", padx=(8, 12))
         ttk.Button(top, text="浏览", command=self.select_file).grid(row=0, column=2, padx=6)
@@ -1284,15 +1284,15 @@ class BreathReducerApp:
         self.export_segments_btn.pack(side=tk.LEFT, padx=8)
         self.clear_selection_btn = ttk.Button(buttons, text="清空选区", command=self.clear_selected_ranges, state=tk.DISABLED)
         self.clear_selection_btn.pack(side=tk.LEFT, padx=8)
-        self.select_range_btn = ttk.Button(buttons, text="选择区间", command=lambda: self.toggle_range_edit_mode("add"), state=tk.DISABLED)
+        self.select_range_btn = ttk.Button(buttons, text="手动选择区间", command=lambda: self.toggle_range_edit_mode("add"), state=tk.DISABLED)
         self.select_range_btn.pack(side=tk.LEFT, padx=8)
         self.cancel_range_btn = ttk.Button(buttons, text="取消选择", command=lambda: self.toggle_range_edit_mode("remove"), state=tk.DISABLED)
         self.cancel_range_btn.pack(side=tk.LEFT, padx=8)
-        self.zoom_in_btn = ttk.Button(buttons, text="放大长度", command=lambda: self.adjust_zoom(0.5), state=tk.DISABLED)
+        self.zoom_in_btn = ttk.Button(buttons, text="放大比例", command=lambda: self.adjust_zoom(0.5), state=tk.DISABLED)
         self.zoom_in_btn.pack(side=tk.LEFT, padx=8)
-        self.zoom_out_btn = ttk.Button(buttons, text="缩小长度", command=lambda: self.adjust_zoom(2.0), state=tk.DISABLED)
+        self.zoom_out_btn = ttk.Button(buttons, text="缩小比例", command=lambda: self.adjust_zoom(2.0), state=tk.DISABLED)
         self.zoom_out_btn.pack(side=tk.LEFT, padx=8)
-        self.reset_zoom_btn = ttk.Button(buttons, text="重置长度", command=self.reset_zoom, state=tk.DISABLED)
+        self.reset_zoom_btn = ttk.Button(buttons, text="重置比例", command=self.reset_zoom, state=tk.DISABLED)
         self.reset_zoom_btn.pack(side=tk.LEFT, padx=8)
 
         self.status_label = ttk.Label(top, text="状态：等待操作", foreground="blue")
@@ -1373,14 +1373,14 @@ class BreathReducerApp:
         ):
             ax.clear()
             ax.set_title(title)
-            ax.set_xlabel("时间 (秒)")
-            ax.set_ylabel("音量")
+            ax.set_xlabel("")
+            ax.set_ylabel("")
             ax.text(0.5, 0.5, "处理后显示音量谱与吸气片段", transform=ax.transAxes, ha="center", va="center", color="gray")
             canvas.draw_idle()
 
     def select_file(self):
         path = filedialog.askopenfilename(
-            title="选择清唱音频",
+            title="选择音频文件",
             filetypes=[("音频文件", "*.wav *.mp3 *.m4a *.flac"), ("所有文件", "*.*")],
         )
         if not path:
@@ -1505,7 +1505,8 @@ class BreathReducerApp:
         ax.plot(times, envelope, color="#2d6cdf", linewidth=1.2)
         ax.fill_between(times, 0, envelope, color="#8cb7ff", alpha=0.35)
         ax.set_title(f"{title}{'  [当前选择]' if active else ''}")
-        ax.set_ylabel("音量")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
         ax.set_ylim(bottom=0)
 
         try:
@@ -1582,8 +1583,6 @@ class BreathReducerApp:
     def refresh_plots(self):
         self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source")
         self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output")
-        self.ax_output.set_xlabel("时间 (秒)")
-        self.ax_source.set_xlabel("时间 (秒)")
         self.canvas_source.draw_idle()
         self.canvas_output.draw_idle()
         self.sync_scrollbars()
@@ -1912,10 +1911,10 @@ class BreathReducerApp:
             self.select_range_btn.config(text="等待选择")
             self.cancel_range_btn.config(text="取消选择")
         elif self.range_edit_mode == "remove":
-            self.select_range_btn.config(text="选择区间")
+            self.select_range_btn.config(text="手动选择区间")
             self.cancel_range_btn.config(text="等待选择")
         else:
-            self.select_range_btn.config(text="选择区间")
+            self.select_range_btn.config(text="手动选择区间")
             self.cancel_range_btn.config(text="取消选择")
 
     def _save_current_config(self):
