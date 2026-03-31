@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 53
+VERSION = 54
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1459,6 +1459,42 @@ def _apply_output_headroom(audio, target_peak=0.98):
     return (audio * gain).astype(np.float32), gain
 
 
+def _apply_hot_peak_limiter(audio, sr, threshold=0.84):
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return audio
+    if audio.ndim == 1:
+        control = np.abs(audio)
+    else:
+        control = np.max(np.abs(audio), axis=1)
+    if control.size == 0:
+        return audio.astype(np.float32)
+
+    target_gain = np.ones_like(control, dtype=np.float32)
+    hot_mask = control > float(threshold)
+    if not np.any(hot_mask):
+        return audio.astype(np.float32)
+    target_gain[hot_mask] = float(threshold) / np.maximum(control[hot_mask], 1e-6)
+
+    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.0008))
+    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.080))
+    gain_curve = np.ones_like(target_gain, dtype=np.float32)
+    gain_curve[0] = target_gain[0]
+    for idx in range(1, len(target_gain)):
+        coeff = attack_coeff if target_gain[idx] < gain_curve[idx - 1] else release_coeff
+        gain_curve[idx] = coeff * gain_curve[idx - 1] + (1.0 - coeff) * target_gain[idx]
+
+    lookahead = max(1, int(round(sr * 0.004)))
+    if len(gain_curve) > lookahead:
+        shifted = gain_curve.copy()
+        shifted[:-lookahead] = gain_curve[lookahead:]
+        shifted[-lookahead:] = gain_curve[-1]
+        gain_curve = np.minimum(gain_curve, shifted)
+
+    gain_curve = np.clip(gain_curve, 0.55, 1.0).astype(np.float32)
+    return _apply_sample_gain_curve(audio, gain_curve)
+
+
 def _smoothstep(values):
     values = np.asarray(values, dtype=np.float32)
     clipped = np.clip(values, 0.0, 1.0)
@@ -1487,8 +1523,11 @@ def _compute_loud_phrase_taming_gain(audio, sr):
             "min_gain": 1.0,
         }
 
-    smooth_window = max(1, int(round(sr * 0.006)))
-    control_env = _moving_average(control, smooth_window)
+    fast_window = max(1, int(round(sr * 0.0015)))
+    body_window = max(1, int(round(sr * 0.010)))
+    fast_env = _moving_average(control, fast_window)
+    body_env = _moving_average(control, body_window)
+    control_env = np.maximum(fast_env, body_env * 1.06)
     control_peak = float(np.max(control_env))
     if control_peak <= 0.0:
         return np.ones_like(control_env, dtype=np.float32), {
@@ -1499,9 +1538,9 @@ def _compute_loud_phrase_taming_gain(audio, sr):
         }
 
     p90 = float(np.percentile(control_env, 90))
-    p97 = float(np.percentile(control_env, 97))
+    p96 = float(np.percentile(control_env, 96))
     p995 = float(np.percentile(control_env, 99.5))
-    threshold = max(p97, p90 * 1.22, 0.18)
+    threshold = max(p96, p90 * 1.12, 0.14)
     if control_peak <= threshold * 1.02:
         return np.ones_like(control_env, dtype=np.float32), {
             "active": False,
@@ -1510,8 +1549,8 @@ def _compute_loud_phrase_taming_gain(audio, sr):
             "min_gain": 1.0,
         }
 
-    ratio = 3.8
-    knee = max(threshold * 0.45, 0.035)
+    ratio = 4.8
+    knee = max(threshold * 0.34, 0.025)
     desired = control_env.copy()
     hard_mask = control_env > threshold
     desired[hard_mask] = threshold + (control_env[hard_mask] - threshold) / ratio
@@ -1524,17 +1563,32 @@ def _compute_loud_phrase_taming_gain(audio, sr):
     target_gain = 1.0 - knee_mix * (1.0 - hard_gain)
 
     extra_hot = np.clip((control_env - p995) / max(control_peak - p995, 1e-6), 0.0, 1.0)
-    target_gain *= 1.0 - 0.12 * extra_hot
-    target_gain = np.clip(target_gain, 0.58, 1.0)
+    fast_hot = np.clip((fast_env - threshold) / max(control_peak - threshold, 1e-6), 0.0, 1.0)
+    transient_ratio = fast_env / np.maximum(body_env, 1e-4)
+    transient_hot = np.clip((transient_ratio - 1.08) / 0.55, 0.0, 1.0) * np.clip(
+        (fast_env - threshold * 0.90) / max(control_peak - threshold * 0.90, 1e-6),
+        0.0,
+        1.0,
+    )
+    target_gain *= 1.0 - 0.18 * extra_hot
+    target_gain *= 1.0 - 0.16 * fast_hot
+    target_gain *= 1.0 - 0.32 * transient_hot
+    target_gain = np.clip(target_gain, 0.38, 1.0)
 
-    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.010))
-    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.180))
+    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.0018))
+    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.120))
     smoothed_gain = np.ones_like(target_gain, dtype=np.float32)
     smoothed_gain[0] = target_gain[0]
     for idx in range(1, len(target_gain)):
         coeff = attack_coeff if target_gain[idx] < smoothed_gain[idx - 1] else release_coeff
         smoothed_gain[idx] = coeff * smoothed_gain[idx - 1] + (1.0 - coeff) * target_gain[idx]
-    smoothed_gain = np.clip(smoothed_gain, 0.58, 1.0).astype(np.float32)
+    lookahead = max(1, int(round(sr * 0.008)))
+    if len(smoothed_gain) > lookahead:
+        lookahead_gain = smoothed_gain.copy()
+        lookahead_gain[:-lookahead] = smoothed_gain[lookahead:]
+        lookahead_gain[-lookahead:] = smoothed_gain[-1]
+        smoothed_gain = np.minimum(smoothed_gain, lookahead_gain)
+    smoothed_gain = np.clip(smoothed_gain, 0.38, 1.0).astype(np.float32)
     return smoothed_gain, {
         "active": True,
         "threshold": threshold,
@@ -1556,6 +1610,11 @@ def _apply_sample_gain_curve(audio, gain_curve):
     adjusted = audio.copy()
     adjusted[:usable] *= gain_curve[:usable, None]
     return adjusted.astype(np.float32)
+
+
+def _load_actual_output_audio(output_path):
+    analysis_audio, playback_audio, _ = _load_audio_for_processing(str(output_path))
+    return np.asarray(analysis_audio, dtype=np.float32), np.asarray(playback_audio, dtype=np.float32)
 
 
 def process_breath(
@@ -1603,17 +1662,23 @@ def process_breath(
         y_processed_plot = _apply_sample_gain_curve(y_processed_plot, loud_taming_gain)
         y_processed_playback, output_headroom_gain = _apply_output_headroom(y_processed_playback)
         y_processed_plot = (y_processed_plot * output_headroom_gain).astype(np.float32)
+        y_processed_playback = _apply_hot_peak_limiter(y_processed_playback, sr)
+        y_processed_plot = _apply_hot_peak_limiter(y_processed_plot, sr)
 
         output_path = _build_output_path(input_path)
         if output_path.exists():
             output_path.unlink()
         _write_output_mp3(y_processed_playback, sr, output_path, bitrate_kbps=bitrate_kbps)
 
+        output_display_audio, output_display_playback_audio = _load_actual_output_audio(output_path)
+
         return {
             "source_audio": analysis_audio,
             "output_audio": y_processed_plot,
+            "output_display_audio": output_display_audio,
             "source_playback_audio": playback_audio,
             "output_playback_audio": y_processed_playback,
+            "output_display_playback_audio": output_display_playback_audio,
             "sr": sr,
             "segments": breath_segments,
             "auto_segments": list(breath_segments),
@@ -1638,6 +1703,7 @@ class BreathReducerApp:
         self.output_path = ""
         self.source_audio = None
         self.output_audio = None
+        self.output_display_audio = None
         self.source_playback_audio = None
         self.output_playback_audio = None
         self.output_headroom_gain = 1.0
@@ -1914,6 +1980,7 @@ class BreathReducerApp:
 
         self.source_audio = result["source_audio"]
         self.output_audio = result["output_audio"]
+        self.output_display_audio = result.get("output_display_audio", result["output_audio"])
         self.source_playback_audio = result.get("source_playback_audio", result["source_audio"])
         self.output_playback_audio = result.get("output_playback_audio", result["output_audio"])
         self.output_headroom_gain = float(result.get("output_headroom_gain", 1.0))
@@ -2035,7 +2102,10 @@ class BreathReducerApp:
             return
         times, envelope = self._compute_envelope(audio)
         if plot_kind == "output" and len(times):
-            positions = np.arange(len(times), dtype=np.float32) * HOP_LENGTH
+            reference_len = len(self.output_audio) if self.output_audio is not None else len(audio)
+            audio_len = max(1, len(audio))
+            position_scale = reference_len / audio_len
+            positions = np.arange(len(times), dtype=np.float32) * HOP_LENGTH * position_scale
             times = self._map_output_positions_to_source_times(positions)
             duration = len(self.source_audio) / self.sr if self.source_audio is not None else (len(audio) / self.sr)
         else:
@@ -2120,7 +2190,8 @@ class BreathReducerApp:
 
     def refresh_plots(self):
         self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source", plot_kind="source")
-        self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output", plot_kind="output")
+        output_plot_audio = self.output_display_audio if self.output_display_audio is not None else self.output_audio
+        self._draw_wave_envelope(self.ax_output, output_plot_audio, "输出文件音量谱", active=self.active_plot == "output", plot_kind="output")
         self.canvas_source.draw_idle()
         self.canvas_output.draw_idle()
         self.last_playhead_draw_ms = None
@@ -2541,12 +2612,15 @@ class BreathReducerApp:
         self.output_audio = _apply_sample_gain_curve(self.output_audio, loud_taming_gain)
         self.output_playback_audio, self.output_headroom_gain = _apply_output_headroom(self.output_playback_audio)
         self.output_audio = (self.output_audio * self.output_headroom_gain).astype(np.float32)
+        self.output_playback_audio = _apply_hot_peak_limiter(self.output_playback_audio, self.sr)
+        self.output_audio = _apply_hot_peak_limiter(self.output_audio, self.sr)
         if self.input_path:
             self.output_path = str(_build_output_path(self.input_path))
             output_file = Path(self.output_path)
             if output_file.exists():
                 output_file.unlink()
             _write_output_mp3(self.output_playback_audio, self.sr, output_file, bitrate_kbps=int(self.export_bitrate_var.get()))
+            self.output_display_audio, _ = _load_actual_output_audio(output_file)
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
