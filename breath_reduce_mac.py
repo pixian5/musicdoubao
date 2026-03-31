@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 63
+VERSION = 64
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1860,12 +1860,13 @@ class BreathReducerApp:
         if follow_playback and total_duration > 0:
             left = self.current_view_start
             right = left + view_duration
-            margin = min(max(0.25, view_duration * 0.22), view_duration / 2)
+            margin = min(max(0.08, view_duration * 0.08), max(0.08, view_duration / 4))
             new_view_start = self.current_view_start
             if self.selected_time_sec < left + margin:
                 new_view_start = self.selected_time_sec - margin
             elif self.selected_time_sec > right - margin:
-                new_view_start = self.selected_time_sec - (view_duration - margin)
+                lead_ratio = 0.35
+                new_view_start = self.selected_time_sec - view_duration * lead_ratio
             new_view_start = min(max(new_view_start, 0.0), max_start)
             if abs(new_view_start - self.current_view_start) > 1e-6:
                 self.current_view_start = new_view_start
@@ -1878,8 +1879,8 @@ class BreathReducerApp:
         x_value = [self.selected_time_sec, self.selected_time_sec]
         self.source_playhead_line.set_xdata(x_value)
         self.output_playhead_line.set_xdata(x_value)
-        self.canvas_source.draw_idle()
-        self.canvas_output.draw_idle()
+        self.canvas_source.draw()
+        self.canvas_output.draw()
 
     def on_scroll(self, _which, value):
         if self._syncing_scrollbars:
