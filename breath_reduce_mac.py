@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 58
+VERSION = 59
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -578,7 +578,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
 
         seg_smooth = _moving_average(seg_raw, 3)
         follow_smooth = _moving_average(follow_raw, 3)
-        tail_len = max(4, len(seg_smooth) // 6)
+        tail_len = max(4, len(seg_smooth) // 4)
         tail = seg_smooth[-tail_len:]
         combined = np.concatenate((tail, follow_smooth))
         if len(combined) < 5:
@@ -599,7 +599,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
 
         best_valley_idx = None
         seg_tail_offset = len(seg_smooth) - len(tail)
-        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.90)))
+        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.75)))
         for idx in range(1, len(combined) - 2):
             cur = float(combined[idx])
             prev = float(combined[idx - 1])
@@ -617,7 +617,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
                 and max(nxt, nxt2) >= rise_gate
             ):
                 best_valley_idx = idx
-                break
+                continue
 
         if best_valley_idx is None:
             snapped.append((start, end))
