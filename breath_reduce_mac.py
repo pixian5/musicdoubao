@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -1622,11 +1623,23 @@ def _load_actual_output_audio(output_path):
     return np.asarray(analysis_audio, dtype=np.float32), np.asarray(playback_audio, dtype=np.float32)
 
 
+def _finalize_rendered_output(output_plot_audio, output_playback_audio, sr):
+    output_plot_audio = np.asarray(output_plot_audio, dtype=np.float32)
+    output_playback_audio = np.asarray(output_playback_audio, dtype=np.float32)
+    loud_taming_gain, _ = _compute_loud_phrase_taming_gain(output_playback_audio, sr)
+    output_playback_audio = _apply_sample_gain_curve(output_playback_audio, loud_taming_gain)
+    output_plot_audio = _apply_sample_gain_curve(output_plot_audio, loud_taming_gain)
+    output_playback_audio, output_headroom_gain = _apply_output_headroom(output_playback_audio)
+    output_plot_audio = (output_plot_audio * output_headroom_gain).astype(np.float32)
+    output_playback_audio = _apply_hot_peak_limiter(output_playback_audio, sr)
+    output_plot_audio = _apply_hot_peak_limiter(output_plot_audio, sr)
+    return output_plot_audio.astype(np.float32), output_playback_audio.astype(np.float32), float(output_headroom_gain)
+
+
 def process_breath(
     input_path,
     atten_db=18,
     sensitivity=7,
-    bitrate_kbps=128,
     peak_reject_threshold=0.20,
     percentile_reject_threshold=0.20,
     voice_floor_threshold=0.0,
@@ -1662,28 +1675,19 @@ def process_breath(
             breath_segments,
             atten_db=atten_db,
         )
-        loud_taming_gain, _ = _compute_loud_phrase_taming_gain(y_processed_playback, sr)
-        y_processed_playback = _apply_sample_gain_curve(y_processed_playback, loud_taming_gain)
-        y_processed_plot = _apply_sample_gain_curve(y_processed_plot, loud_taming_gain)
-        y_processed_playback, output_headroom_gain = _apply_output_headroom(y_processed_playback)
-        y_processed_plot = (y_processed_plot * output_headroom_gain).astype(np.float32)
-        y_processed_playback = _apply_hot_peak_limiter(y_processed_playback, sr)
-        y_processed_plot = _apply_hot_peak_limiter(y_processed_plot, sr)
-
+        y_processed_plot, y_processed_playback, output_headroom_gain = _finalize_rendered_output(
+            y_processed_plot,
+            y_processed_playback,
+            sr,
+        )
         output_path = _build_output_path(input_path)
-        if output_path.exists():
-            output_path.unlink()
-        _write_output_mp3(y_processed_playback, sr, output_path, bitrate_kbps=bitrate_kbps)
-
-        output_display_audio, output_display_playback_audio = _load_actual_output_audio(output_path)
 
         return {
             "source_audio": analysis_audio,
             "output_audio": y_processed_plot,
-            "output_display_audio": output_display_audio,
+            "output_display_audio": y_processed_plot,
             "source_playback_audio": playback_audio,
             "output_playback_audio": y_processed_playback,
-            "output_display_playback_audio": output_display_playback_audio,
             "sr": sr,
             "segments": breath_segments,
             "auto_segments": list(breath_segments),
@@ -1713,6 +1717,10 @@ class BreathReducerApp:
         self.output_playback_audio = None
         self.output_headroom_gain = 1.0
         self.output_timeline_segments = []
+        self.output_has_post_processing = False
+        self.export_refresh_token = 0
+        self.last_playback_anchor_sec = None
+        self.last_playback_target = None
         self.sr = None
         self.segments = []
         self.auto_segments = []
@@ -1815,6 +1823,8 @@ class BreathReducerApp:
         buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=(12, 0))
         self.process_btn = ttk.Button(buttons, text="重新处理当前文件", command=self.run_process, state=tk.DISABLED)
         self.process_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.export_btn = ttk.Button(buttons, text="导出", command=self.export_output_file, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.LEFT, padx=8)
         self.play_active_source_btn = ttk.Button(buttons, text="播放原文件", command=lambda: self.toggle_active_playback(False), state=tk.DISABLED)
         self.play_active_source_btn.pack(side=tk.LEFT, padx=8)
         self.play_active_output_btn = ttk.Button(buttons, text="播放输出文件", command=lambda: self.toggle_active_playback(True), state=tk.DISABLED)
@@ -1976,7 +1986,6 @@ class BreathReducerApp:
                 self.input_path,
                 self.atten_slider.get(),
                 self.sensitivity_slider.get(),
-                bitrate_kbps,
                 peak_reject_threshold,
                 percentile_reject_threshold,
                 voice_floor_threshold,
@@ -1994,6 +2003,7 @@ class BreathReducerApp:
         self.source_playback_audio = result.get("source_playback_audio", result["source_audio"])
         self.output_playback_audio = result.get("output_playback_audio", result["output_audio"])
         self.output_headroom_gain = float(result.get("output_headroom_gain", 1.0))
+        self.output_has_post_processing = True
         self.output_timeline_segments = result.get("output_timeline_segments", [])
         self.sr = result["sr"]
         self.segments = result["segments"]
@@ -2033,11 +2043,13 @@ class BreathReducerApp:
         self.debug_text.set(_format_diagnostics_text(self.last_diagnostics, len(self.segments)))
         self._save_current_config()
         self.status_label.config(
-            text=f"状态：处理完成，输出文件已生成：{os.path.basename(self.output_path)}",
+            text="状态：处理完成，当前显示为内存输出；点击“导出”才会写入磁盘",
             foreground="green",
         )
         segment_state = tk.NORMAL if self.segments else tk.DISABLED
         click_play_state = tk.NORMAL if self.source_audio is not None else tk.DISABLED
+        export_state = tk.NORMAL if self.output_audio is not None else tk.DISABLED
+        self.export_btn.config(state=export_state)
         self.play_active_source_btn.config(state=click_play_state)
         self.play_active_output_btn.config(state=click_play_state)
         self.half_time_btn.config(state=segment_state)
@@ -2624,20 +2636,63 @@ class BreathReducerApp:
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
-        loud_taming_gain, _ = _compute_loud_phrase_taming_gain(self.output_playback_audio, self.sr)
-        self.output_playback_audio = _apply_sample_gain_curve(self.output_playback_audio, loud_taming_gain)
-        self.output_audio = _apply_sample_gain_curve(self.output_audio, loud_taming_gain)
-        self.output_playback_audio, self.output_headroom_gain = _apply_output_headroom(self.output_playback_audio)
-        self.output_audio = (self.output_audio * self.output_headroom_gain).astype(np.float32)
-        self.output_playback_audio = _apply_hot_peak_limiter(self.output_playback_audio, self.sr)
-        self.output_audio = _apply_hot_peak_limiter(self.output_audio, self.sr)
-        if self.input_path:
-            self.output_path = str(_build_output_path(self.input_path))
-            output_file = Path(self.output_path)
-            if output_file.exists():
-                output_file.unlink()
-            _write_output_mp3(self.output_playback_audio, self.sr, output_file, bitrate_kbps=int(self.export_bitrate_var.get()))
-            self.output_display_audio, _ = _load_actual_output_audio(output_file)
+        self.output_display_audio = self.output_audio
+        self.output_headroom_gain = 1.0
+        self.output_has_post_processing = False
+
+    def _schedule_actual_output_refresh(self, output_file):
+        self.export_refresh_token += 1
+        token = self.export_refresh_token
+
+        def worker():
+            try:
+                actual_audio, _ = _load_actual_output_audio(output_file)
+            except Exception:
+                return
+
+            def apply_result():
+                if token != self.export_refresh_token:
+                    return
+                self.output_display_audio = actual_audio
+                self.refresh_plots()
+                self.status_label.config(
+                    text=f"状态：导出完成，真实 MP3 图谱已刷新：{os.path.basename(output_file)}",
+                    foreground="green",
+                )
+
+            try:
+                self.root.after(0, apply_result)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def export_output_file(self):
+        if self.output_audio is None or self.output_playback_audio is None or self.sr is None or not self.input_path:
+            self.status_label.config(text="状态：当前没有可导出的输出", foreground="blue")
+            return
+        try:
+            bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
+        except ValueError:
+            messagebox.showwarning("提示", "导出码率需要填写数字")
+            return
+        self.export_bitrate_var.set(str(bitrate_kbps))
+
+        export_plot = np.asarray(self.output_audio, dtype=np.float32)
+        export_playback = np.asarray(self.output_playback_audio, dtype=np.float32)
+        if not self.output_has_post_processing:
+            export_plot, export_playback, _ = _finalize_rendered_output(export_plot, export_playback, self.sr)
+
+        self.output_path = str(_build_output_path(self.input_path))
+        output_file = Path(self.output_path)
+        if output_file.exists():
+            output_file.unlink()
+        _write_output_mp3(export_playback, self.sr, output_file, bitrate_kbps=bitrate_kbps)
+        self.status_label.config(
+            text=f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
+            foreground="green",
+        )
+        self._schedule_actual_output_refresh(output_file)
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
@@ -3010,7 +3065,8 @@ class BreathReducerApp:
         if audio is None:
             return
 
-        start_sample = int(max(0, self.selected_time_sec) * self.sr)
+        requested_source_time = float(max(0, self.selected_time_sec))
+        start_sample = int(requested_source_time * self.sr)
         if processed:
             start_sample = self._map_source_sample_to_output_sample(start_sample)
         if start_sample >= len(audio):
@@ -3027,6 +3083,8 @@ class BreathReducerApp:
         sf.write(temp_audio.name, np.asarray(clip, dtype=np.float32), self.sr)
         self.playback_temp_path = temp_audio.name
         self.player_process = subprocess.Popen(["afplay", temp_audio.name])
+        self.last_playback_anchor_sec = requested_source_time
+        self.last_playback_target = "output" if processed else "source"
         self._start_playback_tracking(
             start_sample / self.sr,
             len(clip) / self.sr,
@@ -3090,6 +3148,16 @@ class BreathReducerApp:
                 self._pause_active_playback()
                 self.status_label.config(text=f"状态：已暂停{('输出文件' if processed else '原文件')}", foreground="blue")
             return
+        total_duration = len(self.source_audio) / self.sr if self.source_audio is not None and self.sr else None
+        if (
+            total_duration is not None
+            and self.selected_time_sec is not None
+            and self.last_playback_anchor_sec is not None
+            and self.last_playback_target == target
+            and self.selected_time_sec >= total_duration - 0.05
+        ):
+            self.selected_time_sec = min(max(self.last_playback_anchor_sec, 0.0), total_duration)
+            self._update_playhead_display(follow_playback=True, force_refresh=True)
         self.play_active_selection(processed)
         self.status_label.config(text=f"状态：开始从当前选中位置播放{('输出文件' if processed else '原文件')}", foreground="blue")
 
