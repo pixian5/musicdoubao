@@ -1317,13 +1317,14 @@ def _build_half_time_segment(segment):
 
 def _build_breath_silence_envelope(segment, sr, gain):
     segment = np.asarray(segment, dtype=np.float32)
-    envelope = np.zeros_like(segment, dtype=np.float32)
-    if len(segment) == 0:
+    sample_count = segment.shape[0] if segment.ndim > 1 else len(segment)
+    envelope = np.zeros(sample_count, dtype=np.float32)
+    if sample_count == 0:
         return envelope
 
-    left_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
-    right_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
-    overlap_guard = max(1, len(segment) // 2)
+    left_feather_len = min(int(0.050 * sr), max(sample_count - 1, 1))
+    right_feather_len = min(int(0.050 * sr), max(sample_count - 1, 1))
+    overlap_guard = max(1, sample_count // 2)
     left_feather_len = min(left_feather_len, overlap_guard)
     right_feather_len = min(right_feather_len, overlap_guard)
 
@@ -1347,8 +1348,12 @@ def _build_processed_segment(segment, sr, gain, half_time=False):
     if half_time:
         compressed = _build_half_time_segment(segment)
         envelope = _build_breath_silence_envelope(compressed, sr, gain).astype(np.float32)
+        if compressed.ndim > 1:
+            return compressed * envelope[:, None]
         return compressed * envelope
     envelope = _build_breath_silence_envelope(segment, sr, gain).astype(np.float32)
+    if segment.ndim > 1:
+        return segment * envelope[:, None]
     return segment * envelope
 
 
@@ -1390,7 +1395,7 @@ def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments
 
     if not rendered_chunks:
         return np.asarray([], dtype=np.float32), []
-    return np.concatenate(rendered_chunks).astype(np.float32), timeline_segments
+    return np.concatenate(rendered_chunks, axis=0).astype(np.float32), timeline_segments
 
 
 def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segments=None):
@@ -1404,6 +1409,18 @@ def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segmen
     return output_audio
 
 
+def _load_audio_for_processing(input_path):
+    y_full, sr = librosa.load(input_path, sr=None, mono=False)
+    y_full = np.asarray(y_full, dtype=np.float32)
+    if y_full.ndim == 1:
+        playback_audio = y_full
+        analysis_audio = y_full.copy()
+    else:
+        playback_audio = np.asarray(y_full.T, dtype=np.float32)
+        analysis_audio = np.asarray(librosa.to_mono(y_full), dtype=np.float32)
+    return analysis_audio, playback_audio, sr
+
+
 def process_breath(
     input_path,
     atten_db=18,
@@ -1415,9 +1432,9 @@ def process_breath(
     right_append_ms=RIGHT_APPEND_MS,
 ):
     try:
-        y, sr = librosa.load(input_path, sr=None, mono=True)
+        analysis_audio, playback_audio, sr = _load_audio_for_processing(input_path)
         breath_segments, diagnostics = _detect_breath_segments(
-            y,
+            analysis_audio,
             sr,
             sensitivity,
             peak_reject_threshold,
@@ -1427,20 +1444,33 @@ def process_breath(
         breath_segments = _expand_segments(
             breath_segments,
             sr,
-            len(y),
+            len(analysis_audio),
             left_append_ms=left_append_ms,
             right_append_ms=right_append_ms,
         )
-        y_processed, output_timeline_segments = _render_output_audio(y, sr, breath_segments, atten_db=atten_db)
+        y_processed_plot, output_timeline_segments = _render_output_audio(
+            analysis_audio,
+            sr,
+            breath_segments,
+            atten_db=atten_db,
+        )
+        y_processed_playback, _ = _render_output_audio(
+            playback_audio,
+            sr,
+            breath_segments,
+            atten_db=atten_db,
+        )
 
         output_path = _build_output_path(input_path)
         if output_path.exists():
             output_path.unlink()
-        _write_output_mp3(y_processed, sr, output_path)
+        _write_output_mp3(y_processed_playback, sr, output_path)
 
         return {
-            "source_audio": y,
-            "output_audio": y_processed,
+            "source_audio": analysis_audio,
+            "output_audio": y_processed_plot,
+            "source_playback_audio": playback_audio,
+            "output_playback_audio": y_processed_playback,
             "sr": sr,
             "segments": breath_segments,
             "auto_segments": list(breath_segments),
@@ -1464,6 +1494,8 @@ class BreathReducerApp:
         self.output_path = ""
         self.source_audio = None
         self.output_audio = None
+        self.source_playback_audio = None
+        self.output_playback_audio = None
         self.output_timeline_segments = []
         self.sr = None
         self.segments = []
@@ -1723,6 +1755,8 @@ class BreathReducerApp:
 
         self.source_audio = result["source_audio"]
         self.output_audio = result["output_audio"]
+        self.source_playback_audio = result.get("source_playback_audio", result["source_audio"])
+        self.output_playback_audio = result.get("output_playback_audio", result["output_audio"])
         self.output_timeline_segments = result.get("output_timeline_segments", [])
         self.sr = result["sr"]
         self.segments = result["segments"]
@@ -2324,12 +2358,20 @@ class BreathReducerApp:
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
+        playback_source = self.source_playback_audio if self.source_playback_audio is not None else self.source_audio
+        self.output_playback_audio, _ = _render_output_audio(
+            playback_source,
+            self.sr,
+            self.segments,
+            atten_db=self.atten_slider.get(),
+            half_time_segments=half_time_segments,
+        )
         if self.input_path:
             self.output_path = str(_build_output_path(self.input_path))
             output_file = Path(self.output_path)
             if output_file.exists():
                 output_file.unlink()
-            _write_output_mp3(self.output_audio, self.sr, output_file)
+            _write_output_mp3(self.output_playback_audio, self.sr, output_file)
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
@@ -2698,7 +2740,7 @@ class BreathReducerApp:
             messagebox.showwarning("提示", "请先点击图上的位置")
             return
 
-        audio = self.output_audio if processed else self.source_audio
+        audio = self.output_playback_audio if processed else self.source_playback_audio
         if audio is None:
             return
 
@@ -2727,7 +2769,7 @@ class BreathReducerApp:
 
     def _resume_active_playback(self):
         resume_from = self.selected_time_sec if self.selected_time_sec is not None else self.playback_start_audio_time
-        audio = self.output_audio if self.playback_plot_kind == "output" else self.source_audio
+        audio = self.output_playback_audio if self.playback_plot_kind == "output" else self.source_playback_audio
         if audio is None or self.sr is None:
             return
         start_sample = int(max(0, resume_from) * self.sr)
@@ -2790,7 +2832,7 @@ class BreathReducerApp:
             messagebox.showwarning("提示", "请先点击绿色片段")
             return
 
-        audio = self.output_audio if processed else self.source_audio
+        audio = self.output_playback_audio if processed else self.source_playback_audio
         if audio is None:
             return
 
