@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 62
+VERSION = 63
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1317,6 +1317,33 @@ def _build_half_time_segment(segment):
     return output
 
 
+def _build_breath_silence_envelope(segment, sr, gain):
+    segment = np.asarray(segment, dtype=np.float32)
+    envelope = np.zeros_like(segment, dtype=np.float32)
+    if len(segment) == 0:
+        return envelope
+
+    left_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
+    right_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
+    overlap_guard = max(1, len(segment) // 2)
+    left_feather_len = min(left_feather_len, overlap_guard)
+    right_feather_len = min(right_feather_len, overlap_guard)
+
+    if left_feather_len > 1:
+        left_curve = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, left_feather_len, dtype=np.float32))
+        envelope[:left_feather_len] = np.maximum(envelope[:left_feather_len], left_curve)
+    else:
+        envelope[0] = 1.0
+
+    if right_feather_len > 1:
+        right_curve = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, right_feather_len, dtype=np.float32))
+        envelope[-right_feather_len:] = np.maximum(envelope[-right_feather_len:], right_curve)
+    else:
+        envelope[-1] = 1.0
+
+    return np.clip(envelope * max(gain, 0.0), 0.0, 1.0)
+
+
 def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segments=None):
     y_processed = y.copy()
     gain = np.power(10, -atten_db / 20)
@@ -1328,37 +1355,12 @@ def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segmen
         if end <= start:
             continue
         segment = np.asarray(y_processed[start:end], dtype=np.float32)
+        envelope = _build_breath_silence_envelope(segment, sr, gain).astype(np.float32)
         if (int(start), int(end)) in half_time_lookup:
-            y_processed[start:end] = _build_half_time_segment(segment)
+            half_time_segment = _build_half_time_segment(segment)
+            y_processed[start:end] = half_time_segment * envelope
             continue
-        env_window = max(16, int(0.012 * sr))
-        local_env = _moving_average(np.abs(segment), env_window)
-        env_low = float(np.percentile(local_env, 15))
-        env_high = float(np.percentile(local_env, 88))
-        env_norm = np.clip((local_env - env_low) / (env_high - env_low + 1e-6), 0.0, 1.0)
-        env_norm = _moving_average(env_norm, max(8, int(0.010 * sr)))
-
-        envelope = np.zeros_like(segment, dtype=np.float32)
-        left_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
-        right_feather_len = min(int(0.050 * sr), max(len(segment) - 1, 1))
-        overlap_guard = max(1, len(segment) // 2)
-        left_feather_len = min(left_feather_len, overlap_guard)
-        right_feather_len = min(right_feather_len, overlap_guard)
-
-        if left_feather_len > 1:
-            left_curve = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, left_feather_len, dtype=np.float32))
-            envelope[:left_feather_len] = np.maximum(envelope[:left_feather_len], left_curve)
-        elif len(segment):
-            envelope[0] = 1.0
-
-        if right_feather_len > 1:
-            right_curve = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, right_feather_len, dtype=np.float32))
-            envelope[-right_feather_len:] = np.maximum(envelope[-right_feather_len:], right_curve)
-        elif len(segment):
-            envelope[-1] = 1.0
-
-        envelope = np.clip(envelope * max(gain, 0.0), 0.0, 1.0)
-        processed_segment = segment * envelope.astype(np.float32)
+        processed_segment = segment * envelope
         y_processed[start:end] = processed_segment
 
     return y_processed
