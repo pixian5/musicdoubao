@@ -30,6 +30,7 @@ def _load_app_config():
     defaults = {
         "atten_db": 30,
         "sensitivity": 10,
+        "export_bitrate_kbps": 128,
         "peak_reject": 3.0,
         "percentile_reject": 20.0,
         "voice_floor": 2.0,
@@ -1198,11 +1199,12 @@ def _expand_segments(segments, sr, total_length, left_append_ms=LEFT_APPEND_MS, 
     return _time_ranges_to_samples(merged, sr, total_length)
 
 
-def _write_output_mp3(y_processed, sr, output_path):
+def _write_output_mp3(y_processed, sr, output_path, bitrate_kbps=128):
     ffmpeg_bin = _find_ffmpeg_binary()
     temp_wav = tempfile.NamedTemporaryFile(prefix="breath_processed_", suffix=".wav", delete=False)
     temp_wav.close()
     sf.write(temp_wav.name, y_processed, sr, subtype="FLOAT")
+    bitrate_kbps = int(np.clip(int(bitrate_kbps), 64, 320))
     try:
         subprocess.run(
             [
@@ -1213,7 +1215,7 @@ def _write_output_mp3(y_processed, sr, output_path):
                 "-codec:a",
                 "libmp3lame",
                 "-b:a",
-                "320k",
+                f"{bitrate_kbps}k",
                 str(output_path),
             ],
             check=True,
@@ -1460,6 +1462,7 @@ def process_breath(
     input_path,
     atten_db=18,
     sensitivity=7,
+    bitrate_kbps=128,
     peak_reject_threshold=0.20,
     percentile_reject_threshold=0.20,
     voice_floor_threshold=0.0,
@@ -1501,7 +1504,7 @@ def process_breath(
         output_path = _build_output_path(input_path)
         if output_path.exists():
             output_path.unlink()
-        _write_output_mp3(y_processed_playback, sr, output_path)
+        _write_output_mp3(y_processed_playback, sr, output_path, bitrate_kbps=bitrate_kbps)
 
         return {
             "source_audio": analysis_audio,
@@ -1556,6 +1559,7 @@ class BreathReducerApp:
         self.voice_floor_var = tk.StringVar(value=str(self.app_config.get("voice_floor", 2)))
         self.left_append_ms_var = tk.StringVar(value=str(self.app_config.get("left_append_ms", LEFT_APPEND_MS)))
         self.right_append_ms_var = tk.StringVar(value=str(self.app_config.get("right_append_ms", RIGHT_APPEND_MS)))
+        self.export_bitrate_var = tk.StringVar(value=str(int(self.app_config.get("export_bitrate_kbps", 128))))
         self.active_plot = "source"
         self.selected_time_sec = None
         self.selection_mode = False
@@ -1621,10 +1625,19 @@ class BreathReducerApp:
         ttk.Label(top, text="向右附加(毫秒)：").grid(row=4, column=0, sticky="w", pady=(10, 0))
         self.right_append_entry = ttk.Entry(top, textvariable=self.right_append_ms_var, width=10)
         self.right_append_entry.grid(row=4, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(top, text="人声下限按 0-100 输入，支持小数；低于此下限的每一帧都会直接按吸气处理", foreground="gray").grid(row=4, column=2, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="导出码率：").grid(row=4, column=2, sticky="w", pady=(10, 0))
+        self.export_bitrate_combo = ttk.Combobox(
+            top,
+            textvariable=self.export_bitrate_var,
+            values=[str(value) for value in range(64, 321)],
+            width=8,
+            state="readonly",
+        )
+        self.export_bitrate_combo.grid(row=4, column=3, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="人声下限按 0-100 输入，支持小数；低于此下限的每一帧都会直接按吸气处理", foreground="gray").grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
 
         buttons = ttk.Frame(top)
-        buttons.grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=(12, 0))
         self.process_btn = ttk.Button(buttons, text="重新处理当前文件", command=self.run_process, state=tk.DISABLED)
         self.process_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.play_active_source_btn = ttk.Button(buttons, text="播放原文件", command=lambda: self.toggle_active_playback(False), state=tk.DISABLED)
@@ -1653,7 +1666,7 @@ class BreathReducerApp:
         self.reset_zoom_btn.pack(side=tk.LEFT, padx=8)
 
         self.status_label = ttk.Label(top, text="状态：等待操作", foreground="blue")
-        self.status_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        self.status_label.grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         self.diagnostic_button = tk.Button(
             top,
@@ -1666,7 +1679,7 @@ class BreathReducerApp:
             wraplength=1120,
             cursor="hand2",
         )
-        self.diagnostic_button.grid(row=7, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        self.diagnostic_button.grid(row=8, column=0, columnspan=4, sticky="we", pady=(8, 0))
 
     def _build_plot(self):
         plot_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -1766,8 +1779,9 @@ class BreathReducerApp:
             voice_floor_threshold = np.clip(float(self.voice_floor_var.get()), 0.0, 100.0) / 100.0
             left_append_ms = float(self.left_append_ms_var.get())
             right_append_ms = float(self.right_append_ms_var.get())
+            bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
         except ValueError:
-            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、向左附加和向右附加都需要填写数字")
+            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、向左附加、向右附加和导出码率都需要填写数字")
             return
 
         self.peak_reject_var.set(f"{peak_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
@@ -1775,12 +1789,14 @@ class BreathReducerApp:
         self.voice_floor_var.set(f"{voice_floor_threshold * 100:.2f}".rstrip("0").rstrip("."))
         self.left_append_ms_var.set(f"{left_append_ms:.2f}".rstrip("0").rstrip("."))
         self.right_append_ms_var.set(f"{right_append_ms:.2f}".rstrip("0").rstrip("."))
+        self.export_bitrate_var.set(str(bitrate_kbps))
 
         try:
             result = process_breath(
                 self.input_path,
                 self.atten_slider.get(),
                 self.sensitivity_slider.get(),
+                bitrate_kbps,
                 peak_reject_threshold,
                 percentile_reject_threshold,
                 voice_floor_threshold,
@@ -2364,6 +2380,7 @@ class BreathReducerApp:
         self.app_config = {
             "atten_db": int(self.atten_slider.get()),
             "sensitivity": int(self.sensitivity_slider.get()),
+            "export_bitrate_kbps": int(self.export_bitrate_var.get() or 128),
             "peak_reject": float(self.peak_reject_var.get() or 0),
             "percentile_reject": float(self.percentile_reject_var.get() or 0),
             "voice_floor": float(self.voice_floor_var.get() or 0),
@@ -2413,7 +2430,7 @@ class BreathReducerApp:
             output_file = Path(self.output_path)
             if output_file.exists():
                 output_file.unlink()
-            _write_output_mp3(self.output_playback_audio, self.sr, output_file)
+            _write_output_mp3(self.output_playback_audio, self.sr, output_file, bitrate_kbps=int(self.export_bitrate_var.get()))
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
