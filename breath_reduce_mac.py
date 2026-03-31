@@ -1445,6 +1445,17 @@ def _load_audio_for_processing(input_path):
     return analysis_audio, playback_audio, sr
 
 
+def _apply_output_headroom(audio, target_peak=0.98):
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return audio, 1.0
+    peak = float(np.max(np.abs(audio)))
+    if peak <= 0.0 or peak <= float(target_peak):
+        return audio, 1.0
+    gain = float(target_peak) / peak
+    return (audio * gain).astype(np.float32), gain
+
+
 def process_breath(
     input_path,
     atten_db=18,
@@ -1484,6 +1495,8 @@ def process_breath(
             breath_segments,
             atten_db=atten_db,
         )
+        y_processed_playback, output_headroom_gain = _apply_output_headroom(y_processed_playback)
+        y_processed_plot = (y_processed_plot * output_headroom_gain).astype(np.float32)
 
         output_path = _build_output_path(input_path)
         if output_path.exists():
@@ -1501,6 +1514,7 @@ def process_breath(
             "diagnostics": diagnostics,
             "output_path": str(output_path),
             "output_timeline_segments": output_timeline_segments,
+            "output_headroom_gain": output_headroom_gain,
         }
     except Exception as exc:
         raise RuntimeError(f"处理失败：{exc}") from exc
@@ -1520,6 +1534,7 @@ class BreathReducerApp:
         self.output_audio = None
         self.source_playback_audio = None
         self.output_playback_audio = None
+        self.output_headroom_gain = 1.0
         self.output_timeline_segments = []
         self.sr = None
         self.segments = []
@@ -1781,6 +1796,7 @@ class BreathReducerApp:
         self.output_audio = result["output_audio"]
         self.source_playback_audio = result.get("source_playback_audio", result["source_audio"])
         self.output_playback_audio = result.get("output_playback_audio", result["output_audio"])
+        self.output_headroom_gain = float(result.get("output_headroom_gain", 1.0))
         self.output_timeline_segments = result.get("output_timeline_segments", [])
         self.sr = result["sr"]
         self.segments = result["segments"]
@@ -2390,6 +2406,8 @@ class BreathReducerApp:
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
+        self.output_playback_audio, self.output_headroom_gain = _apply_output_headroom(self.output_playback_audio)
+        self.output_audio = (self.output_audio * self.output_headroom_gain).astype(np.float32)
         if self.input_path:
             self.output_path = str(_build_output_path(self.input_path))
             output_file = Path(self.output_path)
