@@ -2132,7 +2132,6 @@ class BreathReducerApp:
                 linestyle="--",
                 linewidth=1.1,
                 alpha=0.85,
-                label=f"最大峰值 {peak_line * 100:.0f}",
             )
             ax.axhline(
                 percentile_line,
@@ -2140,7 +2139,6 @@ class BreathReducerApp:
                 linestyle="--",
                 linewidth=1.1,
                 alpha=0.85,
-                label=f"最大整体音量 {percentile_line * 100:.0f}",
             )
             if voice_floor_line > 0:
                 ax.axhline(
@@ -2149,9 +2147,7 @@ class BreathReducerApp:
                     linestyle="--",
                     linewidth=1.1,
                     alpha=0.95,
-                    label=f"人声下限 {voice_floor_line * 100:.0f}",
                 )
-            ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
 
         merged_visible_segments = [(start / self.sr, end / self.sr) for start, end in self.segments]
 
