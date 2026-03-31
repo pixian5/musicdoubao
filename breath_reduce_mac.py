@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 59
+VERSION = 60
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -561,12 +561,12 @@ def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_t
     return trimmed
 
 
-def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_floor_threshold):
+def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, peak_reject_threshold, voice_floor_threshold):
     snapped = []
     if not segments:
         return snapped
 
-    look_ahead_frames = max(5, int(round(0.18 / frame_time)))
+    look_ahead_frames = max(6, int(round(0.20 / frame_time)))
     for start, end in segments:
         start_frame = max(0, int(start / HOP_LENGTH))
         end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
@@ -576,58 +576,54 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
             snapped.append((start, end))
             continue
 
-        seg_smooth = _moving_average(seg_raw, 3)
-        follow_smooth = _moving_average(follow_raw, 3)
-        tail_len = max(6, len(seg_smooth) // 2)
-        tail = seg_smooth[-tail_len:]
-        combined = np.concatenate((tail, follow_smooth))
+        combined = np.concatenate((seg_raw, follow_raw))
         if len(combined) < 5:
             snapped.append((start, end))
             continue
 
-        seg_floor = float(np.percentile(seg_smooth, 20))
-        seg_tail_mid = float(np.percentile(tail, 60))
-        valley_limit = max(
-            float(np.min(combined)) * 1.80,
-            float(np.percentile(combined, 35)),
-            seg_floor * 1.05,
-            voice_floor_threshold * 1.02 if voice_floor_threshold > 0 else 0.0,
-            0.004,
-        )
-        seg_tail_offset = len(seg_smooth) - len(tail)
-        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.55)))
-        onset_gate = max(
-            valley_limit * 1.20,
-            seg_tail_mid * 0.95,
-            voice_floor_threshold * 1.18 if voice_floor_threshold > 0 else 0.0,
-            0.010,
-        )
-
-        best_valley_idx = None
-        search_start = max(1, len(combined) - max(8, len(combined) // 2))
-        for idx in range(len(combined) - 3, search_start - 1, -1):
-            cur = float(combined[idx])
-            nxt = float(combined[idx + 1])
-            nxt2 = float(combined[idx + 2])
-            if (
-                cur <= valley_limit
-                and max(nxt, nxt2) >= cur * 1.35
-                and ((nxt + nxt2) / 2.0) >= cur * 1.15
-                and max(nxt, nxt2) >= onset_gate
-            ):
-                best_valley_idx = idx
+        below_threshold = peak_reject_threshold + 1e-6
+        entry_idx = None
+        for idx in range(0, len(seg_raw) - 1):
+            if float(seg_raw[idx]) <= below_threshold and float(seg_raw[idx + 1]) <= max(below_threshold * 1.10, below_threshold + 0.002):
+                entry_idx = idx
                 break
 
-        if best_valley_idx is None:
+        if entry_idx is None:
             snapped.append((start, end))
             continue
 
-        if best_valley_idx < len(tail):
-            cut_idx = seg_tail_offset + best_valley_idx
-        else:
-            cut_idx = len(seg_smooth) - 1
+        crossing_idx = None
+        for idx in range(entry_idx + 1, len(combined)):
+            if float(combined[idx]) > below_threshold:
+                crossing_idx = idx
+                break
 
-        cut_idx = max(min_allowed_cut, min(cut_idx, len(seg_smooth) - 1))
+        if crossing_idx is None:
+            snapped.append((start, end))
+            continue
+
+        search_start = max(entry_idx, crossing_idx - max(18, len(seg_raw) // 2))
+        search_end = max(search_start + 1, crossing_idx)
+        best_valley_idx = None
+        for idx in range(search_start, search_end):
+            cur = float(combined[idx])
+            prev = float(combined[idx - 1])
+            nxt = float(combined[idx + 1]) if idx + 1 < len(combined) else cur
+            if cur <= prev + 1e-6 and cur <= nxt + 1e-6 and cur <= peak_reject_threshold + 1e-6:
+                best_valley_idx = idx
+
+        if best_valley_idx is None:
+            for idx in range(search_end - 1, search_start - 1, -1):
+                cur = float(combined[idx])
+                prev = float(combined[idx - 1]) if idx - 1 >= 0 else cur
+                if cur <= prev + 1e-6 and cur <= peak_reject_threshold + 1e-6:
+                    best_valley_idx = idx
+                    break
+        if best_valley_idx is None:
+            window = combined[search_start:search_end]
+            best_valley_idx = search_start + int(np.argmin(window))
+
+        cut_idx = max(entry_idx, min(best_valley_idx, len(seg_raw) - 1))
         new_end_frame = start_frame + cut_idx
         new_end = int(new_end_frame * frame_time * sr)
         if new_end - start >= int(0.04 * sr):
@@ -822,6 +818,15 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
     if silence_segments:
         segments = sorted(segments + silence_segments, key=lambda item: item[0])
     floor_silence_segments = _detect_low_voice_silence_segments(raw_rms, frame_time, sr, voice_floor_threshold)
+    if floor_silence_segments:
+        floor_silence_segments = _snap_right_edge_to_tail_valley(
+            floor_silence_segments,
+            sr,
+            frame_time,
+            raw_rms,
+            peak_reject_threshold,
+            voice_floor_threshold,
+        )
     if floor_silence_segments:
         segments = sorted(segments + floor_silence_segments, key=lambda item: item[0])
 
@@ -1122,13 +1127,16 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         sr,
         frame_time,
         raw_rms,
+        peak_reject_threshold,
         voice_floor_threshold,
     )
     if floor_silence_segments:
+        filtered_ranges = [(start / sr, end / sr) for start, end in filtered]
+        floor_ranges = [(start / sr, end / sr) for start, end in floor_silence_segments]
+        floor_ranges = _subtract_time_ranges(floor_ranges, filtered_ranges)
         filtered = _merge_time_ranges(
-            [(start / sr, end / sr) for start, end in filtered]
-            + [(start / sr, end / sr) for start, end in floor_silence_segments],
-            min_gap_sec=0.02,
+            filtered_ranges + floor_ranges,
+            min_gap_sec=0.0,
         )
         filtered = _time_ranges_to_samples(filtered, sr, len(y))
 
