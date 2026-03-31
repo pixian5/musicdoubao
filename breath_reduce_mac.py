@@ -1631,7 +1631,7 @@ class BreathReducerApp:
         self.export_bitrate_combo = ttk.Combobox(
             top,
             textvariable=self.export_bitrate_var,
-            values=[str(value) for value in range(64, 321)],
+            values=["64", "128", "192", "256", "320"],
             width=8,
             state="readonly",
         )
