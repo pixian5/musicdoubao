@@ -566,7 +566,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
     if not segments:
         return snapped
 
-    look_ahead_frames = max(4, int(round(0.14 / frame_time)))
+    look_ahead_frames = max(5, int(round(0.18 / frame_time)))
     for start, end in segments:
         start_frame = max(0, int(start / HOP_LENGTH))
         end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
@@ -578,46 +578,45 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
 
         seg_smooth = _moving_average(seg_raw, 3)
         follow_smooth = _moving_average(follow_raw, 3)
-        tail_len = max(4, len(seg_smooth) // 4)
+        tail_len = max(6, len(seg_smooth) // 2)
         tail = seg_smooth[-tail_len:]
         combined = np.concatenate((tail, follow_smooth))
         if len(combined) < 5:
             snapped.append((start, end))
             continue
 
+        seg_floor = float(np.percentile(seg_smooth, 20))
+        seg_tail_mid = float(np.percentile(tail, 60))
         valley_limit = max(
-            float(np.min(combined)) * 1.35,
-            float(np.percentile(seg_smooth, 20)) * 1.10,
-            voice_floor_threshold * 1.05 if voice_floor_threshold > 0 else 0.0,
+            float(np.min(combined)) * 1.80,
+            float(np.percentile(combined, 35)),
+            seg_floor * 1.05,
+            voice_floor_threshold * 1.02 if voice_floor_threshold > 0 else 0.0,
             0.004,
         )
-        rise_gate = max(
-            valley_limit * 1.8,
-            float(np.percentile(seg_smooth, 70)) * 0.75,
+        seg_tail_offset = len(seg_smooth) - len(tail)
+        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.55)))
+        onset_gate = max(
+            valley_limit * 1.20,
+            seg_tail_mid * 0.95,
+            voice_floor_threshold * 1.18 if voice_floor_threshold > 0 else 0.0,
             0.010,
         )
 
         best_valley_idx = None
-        seg_tail_offset = len(seg_smooth) - len(tail)
-        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.75)))
-        for idx in range(1, len(combined) - 2):
+        search_start = max(1, len(combined) - max(8, len(combined) // 2))
+        for idx in range(len(combined) - 3, search_start - 1, -1):
             cur = float(combined[idx])
-            prev = float(combined[idx - 1])
             nxt = float(combined[idx + 1])
             nxt2 = float(combined[idx + 2])
-            candidate_seg_idx = seg_tail_offset + idx if idx < len(tail) else len(seg_smooth) - 1
             if (
-                candidate_seg_idx >= min_allowed_cut
-                and
                 cur <= valley_limit
-                and cur <= prev + 1e-6
-                and cur <= nxt + 1e-6
-                and nxt >= cur * 1.20
-                and nxt2 >= nxt * 1.05
-                and max(nxt, nxt2) >= rise_gate
+                and max(nxt, nxt2) >= cur * 1.35
+                and ((nxt + nxt2) / 2.0) >= cur * 1.15
+                and max(nxt, nxt2) >= onset_gate
             ):
                 best_valley_idx = idx
-                continue
+                break
 
         if best_valley_idx is None:
             snapped.append((start, end))
