@@ -943,12 +943,14 @@ def _build_output_path(input_path):
 def _expand_segments(segments, sr, total_length, left_append_ms=LEFT_APPEND_MS, right_append_ms=RIGHT_APPEND_MS):
     if not segments or sr is None or sr <= 0:
         return segments
-    left_samples = max(0, int(round((left_append_ms / 1000.0) * sr)))
-    right_samples = max(0, int(round((right_append_ms / 1000.0) * sr)))
+    left_samples = int(round((left_append_ms / 1000.0) * sr))
+    right_samples = int(round((right_append_ms / 1000.0) * sr))
     expanded = []
     for start, end in segments:
-        new_start = max(0, start - left_samples)
-        new_end = min(total_length, end + right_samples)
+        new_start = start - left_samples
+        new_end = end + right_samples
+        new_start = max(0, min(new_start, total_length))
+        new_end = max(0, min(new_end, total_length))
         if new_end > new_start:
             expanded.append((new_start, new_end))
     merged = _merge_time_ranges([(start / sr, end / sr) for start, end in expanded], min_gap_sec=0.002)
@@ -1405,8 +1407,8 @@ class BreathReducerApp:
             peak_reject_threshold = np.clip(float(self.peak_reject_var.get()), 0.0, 100.0) / 100.0
             percentile_reject_threshold = np.clip(float(self.percentile_reject_var.get()), 0.0, 100.0) / 100.0
             voice_floor_threshold = np.clip(float(self.voice_floor_var.get()), 0.0, 100.0) / 100.0
-            left_append_ms = max(0.0, float(self.left_append_ms_var.get()))
-            right_append_ms = max(0.0, float(self.right_append_ms_var.get()))
+            left_append_ms = float(self.left_append_ms_var.get())
+            right_append_ms = float(self.right_append_ms_var.get())
         except ValueError:
             messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、向左附加和向右附加都需要填写数字")
             return
