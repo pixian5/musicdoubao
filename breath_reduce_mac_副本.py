@@ -1,0 +1,1609 @@
+import os
+import subprocess
+import tempfile
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import librosa
+import numpy as np
+import soundfile as sf
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib import rcParams
+
+VERSION = 28
+HOP_LENGTH = 512
+
+rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
+rcParams["axes.unicode_minus"] = False
+
+
+def _percentile_norm(values, low=5, high=95):
+    values = np.asarray(values, dtype=np.float32)
+    lo = float(np.percentile(values, low))
+    hi = float(np.percentile(values, high))
+    return np.clip((values - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+
+
+def _moving_average(values, window_size):
+    values = np.asarray(values, dtype=np.float32)
+    window_size = max(1, int(window_size))
+    if window_size == 1:
+        return values
+    kernel = np.ones(window_size, dtype=np.float32) / window_size
+    return np.convolve(values, kernel, mode="same")
+
+
+def _close_mask(mask, gap_tolerance):
+    mask = np.asarray(mask, dtype=bool)
+    if gap_tolerance <= 0 or mask.size == 0:
+        return mask
+
+    closed = mask.copy()
+    false_run_start = None
+    for idx, value in enumerate(mask):
+        if not value and false_run_start is None:
+            false_run_start = idx
+        elif value and false_run_start is not None:
+            if idx - false_run_start <= gap_tolerance:
+                closed[false_run_start:idx] = True
+            false_run_start = None
+    return closed
+
+
+def _merge_segments(mask, frame_time, sr, min_duration=0.09, max_duration=0.60):
+    segments = []
+    active = np.flatnonzero(mask)
+    if len(active) == 0:
+        return segments
+
+    start_frame = active[0]
+    prev_frame = active[0]
+
+    for frame in active[1:]:
+        if frame - prev_frame <= 2:
+            prev_frame = frame
+            continue
+
+        start = int(start_frame * frame_time * sr)
+        end = int((prev_frame + 1) * frame_time * sr)
+        duration = (end - start) / sr
+        if min_duration <= duration <= max_duration:
+            segments.append((start, end))
+
+        start_frame = frame
+        prev_frame = frame
+
+    start = int(start_frame * frame_time * sr)
+    end = int((prev_frame + 1) * frame_time * sr)
+    duration = (end - start) / sr
+    if min_duration <= duration <= max_duration:
+        segments.append((start, end))
+    return segments
+
+
+def _sample_slice(values, start_frame, end_frame):
+    start_frame = max(0, start_frame)
+    end_frame = min(len(values), end_frame)
+    if end_frame <= start_frame:
+        return np.asarray([], dtype=np.float32)
+    return np.asarray(values[start_frame:end_frame], dtype=np.float32)
+
+
+def _linear_slope(values):
+    values = np.asarray(values, dtype=np.float32)
+    if len(values) < 2:
+        return 0.0
+    x = np.arange(len(values), dtype=np.float32)
+    x = x - np.mean(x)
+    y = values - np.mean(values)
+    denom = float(np.sum(x * x)) + 1e-6
+    return float(np.sum(x * y) / denom)
+
+
+def _merge_nearby_segments(segments, sr, max_gap=0.10, max_duration=0.45):
+    if not segments:
+        return []
+
+    merged = [dict(segments[0])]
+    max_gap_samples = int(max_gap * sr)
+    max_duration_samples = int(max_duration * sr)
+
+    for item in segments[1:]:
+        prev = merged[-1]
+        gap = item["start"] - prev["end"]
+        combined_duration = item["end"] - prev["start"]
+        if gap <= max_gap_samples and combined_duration <= max_duration_samples:
+            prev["end"] = item["end"]
+            prev["duration"] = (prev["end"] - prev["start"]) / sr
+            prev["mean_score"] = max(prev["mean_score"], item["mean_score"])
+            prev["peak_score"] = max(prev["peak_score"], item["peak_score"])
+            prev["mean_rms"] = min(prev["mean_rms"], item["mean_rms"])
+            prev["rise_ratio"] = max(prev["rise_ratio"], item["rise_ratio"])
+            prev["texture_score"] = max(prev["texture_score"], item["texture_score"])
+        else:
+            merged.append(dict(item))
+    return merged
+
+
+def _expand_segment_edges(segments, sr, frame_time, relaxed_threshold, energy_ceiling, smoothed_score, rms_norm, zcr_norm, centroid_norm):
+    if not segments:
+        return []
+
+    expanded = []
+    max_expand_frames = max(1, int(round(0.16 / frame_time)))
+    edge_threshold = max(0.13, relaxed_threshold - 0.08)
+    edge_energy_limit = min(energy_ceiling * 0.18, 0.10)
+
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = min(len(smoothed_score) - 1, int(np.ceil(end / HOP_LENGTH)))
+
+        new_start = start_frame
+        for _ in range(max_expand_frames):
+            probe = new_start - 1
+            if probe < 0:
+                break
+            if (
+                smoothed_score[probe] >= edge_threshold
+                or (
+                    rms_norm[probe] <= edge_energy_limit
+                    and zcr_norm[probe] >= 0.24
+                    and centroid_norm[probe] >= 0.22
+                )
+            ):
+                new_start = probe
+            else:
+                break
+
+        new_end = end_frame
+        for _ in range(max_expand_frames):
+            probe = new_end + 1
+            if probe >= len(smoothed_score):
+                break
+            if (
+                smoothed_score[probe] >= edge_threshold
+                or (
+                    rms_norm[probe] <= edge_energy_limit
+                    and zcr_norm[probe] >= 0.24
+                    and centroid_norm[probe] >= 0.22
+                )
+            ):
+                new_end = probe
+            else:
+                break
+
+        expanded.append((int(new_start * frame_time * sr), int((new_end + 1) * frame_time * sr)))
+
+    return expanded
+
+
+def _refine_segment_to_core(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm):
+    refined = []
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
+        seg_rms = rms_norm[start_frame:end_frame]
+        seg_score = smoothed_score[start_frame:end_frame]
+        seg_zcr = zcr_norm[start_frame:end_frame]
+        seg_cent = centroid_norm[start_frame:end_frame]
+        if len(seg_rms) == 0:
+            continue
+
+        # 如果整段能量明显偏高，只保留其中更像吸气的低能量核心
+        if float(np.mean(seg_rms)) > 0.10:
+            core_mask = (
+                (seg_rms < min(float(np.mean(seg_rms)) * 0.55, 0.12))
+                & (seg_score > 0.20)
+                & (seg_zcr > 0.36)
+                & (seg_cent > 0.38)
+            )
+            core_segments = _merge_segments(core_mask, frame_time, sr, min_duration=0.06, max_duration=0.52)
+            if core_segments:
+                base = start_frame * frame_time * sr
+                for core_start, core_end in core_segments:
+                    refined.append((int(base + core_start), int(base + core_end)))
+                continue
+
+        refined.append((start, end))
+
+    return refined
+
+
+def _trim_segment_heads_tails(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm, bandwidth_norm):
+    trimmed = []
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
+        seg_score = smoothed_score[start_frame:end_frame]
+        seg_rms = rms_norm[start_frame:end_frame]
+        seg_zcr = zcr_norm[start_frame:end_frame]
+        seg_cent = centroid_norm[start_frame:end_frame]
+        seg_bw = bandwidth_norm[start_frame:end_frame]
+        if len(seg_score) == 0:
+            continue
+
+        core_mask = _close_mask(
+            (seg_rms < 0.09)
+            & (
+                (seg_score > 0.25)
+                | ((seg_zcr > 0.47) & (seg_cent > 0.45) & (seg_bw > 0.44))
+            ),
+            2,
+        )
+        voice_mask = _close_mask(
+            (
+                ((seg_rms > 0.08) & (seg_score < 0.26) & (seg_zcr < 0.42))
+                | ((seg_rms > 0.10) & (seg_cent < 0.44) & (seg_bw < 0.45))
+                | ((seg_rms > 0.12) & (seg_score < 0.33))
+            ),
+            2,
+        )
+
+        active = np.flatnonzero(core_mask)
+        if len(active) == 0:
+            trimmed.append((start, end))
+            continue
+
+        runs = []
+        run_start = active[0]
+        prev = active[0]
+        for frame in active[1:]:
+            if frame - prev <= 2:
+                prev = frame
+                continue
+            runs.append((run_start, prev))
+            run_start = frame
+            prev = frame
+        runs.append((run_start, prev))
+
+        best_start, best_end = max(runs, key=lambda item: item[1] - item[0])
+
+        edge_window = max(2, int(round(0.045 / frame_time)))
+        edge_guard = max(1, int(round(0.020 / frame_time)))
+        left_voice = bool(np.count_nonzero(voice_mask[:edge_window]) >= max(2, edge_window // 2))
+        right_voice = bool(np.count_nonzero(voice_mask[-edge_window:]) >= max(2, edge_window // 2))
+
+        trim_start_frame = start_frame
+        trim_end_frame = end_frame - 1
+        if left_voice and best_start > edge_guard:
+            trim_start_frame = start_frame + max(0, best_start - edge_guard)
+        if right_voice and (len(seg_score) - 1 - best_end) > edge_guard:
+            trim_end_frame = start_frame + min(len(seg_score) - 1, best_end + edge_guard)
+
+        trimmed_start = int(trim_start_frame * frame_time * sr)
+        trimmed_end = int((trim_end_frame + 1) * frame_time * sr)
+        duration = (trimmed_end - trimmed_start) / sr
+        removed_ratio = 1.0 - (duration / max((end - start) / sr, 1e-6))
+        if 0.08 <= duration <= 0.65 and removed_ratio <= 0.60:
+            trimmed.append((trimmed_start, trimmed_end))
+        else:
+            trimmed.append((start, end))
+
+    return trimmed
+
+
+def _extend_breath_edges(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm, bandwidth_norm):
+    extended = []
+    if not segments:
+        return extended
+
+    max_extend_frames = max(1, int(round(0.16 / frame_time)))
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
+
+        new_start = start_frame
+        for _ in range(max_extend_frames):
+            probe = new_start - 1
+            if probe < 0:
+                break
+            if (
+                rms_norm[probe] <= 0.14
+                and smoothed_score[probe] >= 0.15
+                and zcr_norm[probe] >= 0.36
+                and centroid_norm[probe] >= 0.36
+            ):
+                new_start = probe
+            else:
+                break
+
+        new_end = end_frame - 1
+        for _ in range(max_extend_frames):
+            probe = new_end + 1
+            if probe >= len(smoothed_score):
+                break
+            if (
+                rms_norm[probe] <= 0.14
+                and smoothed_score[probe] >= 0.15
+                and zcr_norm[probe] >= 0.36
+                and centroid_norm[probe] >= 0.36
+            ):
+                new_end = probe
+            else:
+                break
+
+        extended.append((int(new_start * frame_time * sr), int((new_end + 1) * frame_time * sr)))
+    return extended
+
+
+def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, percentile_reject_threshold=0.20):
+    frame_time = HOP_LENGTH / sr
+    rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
+    flatness = librosa.feature.spectral_flatness(y=y, hop_length=HOP_LENGTH)[0]
+    zcr = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
+    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
+    raw_rms = np.asarray(rms, dtype=np.float32)
+
+    rms_norm = _percentile_norm(rms)
+    flatness_norm = _percentile_norm(flatness)
+    zcr_norm = _percentile_norm(zcr)
+    centroid_norm = _percentile_norm(centroid)
+    bandwidth_norm = _percentile_norm(bandwidth)
+    global_voice_p75 = float(np.percentile(raw_rms, 75))
+    global_voice_p87 = float(np.percentile(raw_rms, 87))
+    global_noise_p35 = float(np.percentile(raw_rms, 35))
+
+    sensitivity = int(np.clip(sensitivity, 1, 10))
+    energy_ceiling = np.clip(0.52 + (10 - sensitivity) * 0.045, 0.50, 0.92)
+    energy_floor = np.clip(0.004 + (1 / max(sensitivity, 1)) * 0.01, 0.003, 0.02)
+    noise_floor = np.clip(0.30 - sensitivity * 0.017, 0.08, 0.28)
+
+    lead_rms = np.pad(rms_norm[4:], (0, 4), mode="edge")
+    breath_score = (
+        0.30 * flatness_norm
+        + 0.22 * zcr_norm
+        + 0.18 * centroid_norm
+        + 0.15 * bandwidth_norm
+        + 0.15 * np.clip(lead_rms - rms_norm, 0.0, 1.0)
+    )
+    smooth_frames = max(3, int(round(0.12 / frame_time)))
+    smoothed_score = _moving_average(breath_score, smooth_frames)
+
+    candidate_mask = (
+        (rms_norm > energy_floor)
+        & (rms_norm < energy_ceiling)
+        & (
+            (flatness_norm > noise_floor)
+            | (zcr_norm > max(0.08, noise_floor - 0.02))
+            | (centroid_norm > max(0.08, noise_floor - 0.01))
+            | (bandwidth_norm > max(0.08, noise_floor - 0.01))
+        )
+    )
+
+    strict_threshold = np.clip(0.55 - sensitivity * 0.028, 0.22, 0.50)
+    relaxed_threshold = np.clip(strict_threshold - 0.12, 0.14, 0.42)
+    strict_mask = candidate_mask & (smoothed_score > strict_threshold)
+    relaxed_mask = candidate_mask & (smoothed_score > relaxed_threshold)
+    post_phrase_mask = (
+        (smoothed_score > max(0.18, relaxed_threshold - 0.04))
+        & (rms_norm < 0.13)
+        & (zcr_norm > 0.40)
+        & (centroid_norm > 0.40)
+        & (bandwidth_norm > 0.42)
+        & (lead_rms > np.maximum(rms_norm * 1.35, 0.11))
+    )
+    low_energy_breath_mask = (
+        (smoothed_score > max(0.20, relaxed_threshold - 0.02))
+        & (rms_norm < 0.10)
+        & (flatness_norm > 0.07)
+        & (zcr_norm > 0.42)
+        & (centroid_norm > 0.41)
+        & (bandwidth_norm > 0.43)
+    )
+    rescue_mask = (
+        (smoothed_score > max(0.18, strict_threshold - 0.08))
+        & (rms_norm > energy_floor * 0.8)
+        & (rms_norm < min(energy_ceiling * 0.60, 0.20))
+        & (zcr_norm > 0.22)
+        & (centroid_norm > 0.22)
+    )
+    bright_breath_mask = (
+        (smoothed_score > max(0.26, strict_threshold))
+        & (rms_norm < 0.08)
+        & (zcr_norm > 0.50)
+        & (centroid_norm > 0.48)
+        & (bandwidth_norm > 0.45)
+    )
+    airy_breath_mask = (
+        (smoothed_score > max(0.21, strict_threshold - 0.05))
+        & (rms_norm < 0.09)
+        & (zcr_norm > 0.44)
+        & (centroid_norm > 0.45)
+        & (bandwidth_norm > 0.45)
+    )
+    micro_breath_mask = (
+        (smoothed_score > 0.24)
+        & (rms_norm < 0.085)
+        & (zcr_norm > 0.46)
+        & (centroid_norm > 0.45)
+        & (bandwidth_norm > 0.45)
+    )
+    short_breath_mask = (
+        (smoothed_score > max(0.20, strict_threshold - 0.06))
+        & (rms_norm > energy_floor * 0.7)
+        & (rms_norm < 0.11)
+        & (flatness_norm > 0.11)
+        & (zcr_norm > 0.43)
+        & (centroid_norm > 0.43)
+        & (bandwidth_norm > 0.42)
+    )
+    needle_breath_mask = (
+        (smoothed_score > max(0.30, strict_threshold + 0.02))
+        & (rms_norm < 0.08)
+        & (zcr_norm > 0.56)
+        & (centroid_norm > 0.52)
+        & (bandwidth_norm > 0.50)
+    )
+    core_breath_mask = (
+        (smoothed_score > max(0.23, strict_threshold - 0.02))
+        & (rms_norm < 0.10)
+        & (zcr_norm > 0.42)
+        & (centroid_norm > 0.42)
+        & (bandwidth_norm > 0.44)
+    )
+    relaxed_mask = relaxed_mask | rescue_mask | post_phrase_mask | low_energy_breath_mask
+
+    gap_tolerance = max(1, int(round(0.05 / frame_time)))
+    strict_mask = _close_mask(strict_mask, gap_tolerance)
+    relaxed_gap = max(gap_tolerance, int(round(0.08 / frame_time)))
+    relaxed_mask = _close_mask(relaxed_mask, relaxed_gap)
+    rescue_mask = _close_mask(rescue_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
+    bright_breath_mask = _close_mask(bright_breath_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
+    airy_breath_mask = _close_mask(airy_breath_mask, max(relaxed_gap, int(round(0.16 / frame_time))))
+    micro_breath_mask = _close_mask(micro_breath_mask, max(relaxed_gap, int(round(0.08 / frame_time))))
+    short_breath_mask = _close_mask(short_breath_mask, max(gap_tolerance, int(round(0.05 / frame_time))))
+    needle_breath_mask = _close_mask(needle_breath_mask, max(gap_tolerance, int(round(0.06 / frame_time))))
+    core_breath_mask = _close_mask(core_breath_mask, max(gap_tolerance, int(round(0.07 / frame_time))))
+    post_phrase_mask = _close_mask(post_phrase_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
+    low_energy_breath_mask = _close_mask(low_energy_breath_mask, max(gap_tolerance, int(round(0.08 / frame_time))))
+
+    strict_segments = _merge_segments(strict_mask, frame_time, sr)
+    relaxed_segments = _merge_segments(relaxed_mask, frame_time, sr, min_duration=0.08, max_duration=0.60)
+    segments = list(strict_segments)
+    if relaxed_segments:
+        segments = sorted(segments + relaxed_segments, key=lambda item: item[0])
+    rescue_segments = _merge_segments(rescue_mask, frame_time, sr, min_duration=0.18, max_duration=0.40)
+    bright_segments = _merge_segments(bright_breath_mask, frame_time, sr, min_duration=0.16, max_duration=0.48)
+    airy_segments = _merge_segments(airy_breath_mask, frame_time, sr, min_duration=0.15, max_duration=0.50)
+    micro_segments = _merge_segments(micro_breath_mask, frame_time, sr, min_duration=0.12, max_duration=0.50)
+    short_segments = _merge_segments(short_breath_mask, frame_time, sr, min_duration=0.05, max_duration=0.24)
+    needle_segments = _merge_segments(needle_breath_mask, frame_time, sr, min_duration=0.16, max_duration=0.40)
+    core_segments = _merge_segments(core_breath_mask, frame_time, sr, min_duration=0.14, max_duration=0.42)
+    post_phrase_segments = _merge_segments(post_phrase_mask, frame_time, sr, min_duration=0.12, max_duration=0.55)
+    low_energy_segments = _merge_segments(low_energy_breath_mask, frame_time, sr, min_duration=0.10, max_duration=0.42)
+    if rescue_segments:
+        segments = sorted(segments + rescue_segments, key=lambda item: item[0])
+    if bright_segments:
+        segments = sorted(segments + bright_segments, key=lambda item: item[0])
+    if airy_segments:
+        segments = sorted(segments + airy_segments, key=lambda item: item[0])
+    if micro_segments:
+        segments = sorted(segments + micro_segments, key=lambda item: item[0])
+    if short_segments:
+        segments = sorted(segments + short_segments, key=lambda item: item[0])
+    if needle_segments:
+        segments = sorted(segments + needle_segments, key=lambda item: item[0])
+    if core_segments:
+        segments = sorted(segments + core_segments, key=lambda item: item[0])
+    if post_phrase_segments:
+        segments = sorted(segments + post_phrase_segments, key=lambda item: item[0])
+    if low_energy_segments:
+        segments = sorted(segments + low_energy_segments, key=lambda item: item[0])
+
+    silence_mask = _close_mask(rms_norm < 0.05, max(1, int(round(0.80 / frame_time))))
+    silence_segments = _merge_segments(silence_mask, frame_time, sr, min_duration=3.0, max_duration=20.0)
+    if silence_segments:
+        segments = sorted(segments + silence_segments, key=lambda item: item[0])
+
+    segments = _refine_segment_to_core(
+        segments,
+        sr,
+        frame_time,
+        smoothed_score,
+        rms_norm,
+        zcr_norm,
+        centroid_norm,
+    )
+
+    raw_segments = len(segments)
+    scored_segments = []
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = min(len(smoothed_score), int(np.ceil(end / HOP_LENGTH)))
+
+        segment_score = _sample_slice(smoothed_score, start_frame, end_frame)
+        segment_rms = _sample_slice(rms_norm, start_frame, end_frame)
+        segment_flatness = _sample_slice(flatness_norm, start_frame, end_frame)
+        segment_zcr = _sample_slice(zcr_norm, start_frame, end_frame)
+        segment_centroid = _sample_slice(centroid_norm, start_frame, end_frame)
+        segment_bandwidth = _sample_slice(bandwidth_norm, start_frame, end_frame)
+        segment_raw_rms = _sample_slice(raw_rms, start_frame, end_frame)
+        follow_rms = _sample_slice(rms_norm, end_frame, end_frame + max(2, int(round(0.18 / frame_time))))
+        lead_rms_segment = _sample_slice(rms_norm, max(0, start_frame - max(2, int(round(0.10 / frame_time)))), start_frame)
+        lead_raw_segment = _sample_slice(raw_rms, max(0, start_frame - max(2, int(round(0.20 / frame_time)))), start_frame)
+        follow_raw_segment = _sample_slice(raw_rms, end_frame, end_frame + max(2, int(round(0.20 / frame_time))))
+
+        if len(segment_score) == 0 or len(segment_rms) == 0 or len(segment_raw_rms) == 0:
+            continue
+
+        duration = (end - start) / sr
+        mean_score = float(np.mean(segment_score))
+        peak_score = float(np.max(segment_score))
+        mean_rms = float(np.mean(segment_rms))
+        peak_rms = float(np.percentile(segment_rms, 90))
+        max_rms = float(np.max(segment_rms))
+        mean_raw_rms = float(np.mean(segment_raw_rms))
+        p90_raw_rms = float(np.percentile(segment_raw_rms, 90))
+        max_raw_rms = float(np.max(segment_raw_rms))
+        texture_score = float(
+            0.35 * np.mean(segment_flatness)
+            + 0.25 * np.mean(segment_zcr)
+            + 0.20 * np.mean(segment_centroid)
+            + 0.20 * np.mean(segment_bandwidth)
+        )
+        inner_slice = slice(max(0, len(segment_rms) // 5), max(1, len(segment_rms) - len(segment_rms) // 5))
+        edge_rms = float(
+            np.mean(np.concatenate((segment_rms[: max(1, len(segment_rms) // 6)], segment_rms[-max(1, len(segment_rms) // 6) :])))
+        )
+        middle_rms = float(np.mean(segment_rms[inner_slice])) if len(segment_rms[inner_slice]) else mean_rms
+        edge_score = float(
+            np.mean(np.concatenate((segment_score[: max(1, len(segment_score) // 6)], segment_score[-max(1, len(segment_score) // 6) :])))
+        )
+        middle_score = float(np.mean(segment_score[inner_slice])) if len(segment_score[inner_slice]) else mean_score
+        middle_texture = float(
+            0.35 * np.mean(segment_flatness[inner_slice])
+            + 0.25 * np.mean(segment_zcr[inner_slice])
+            + 0.20 * np.mean(segment_centroid[inner_slice])
+            + 0.20 * np.mean(segment_bandwidth[inner_slice])
+        ) if len(segment_flatness[inner_slice]) else texture_score
+        mean_flatness = float(np.mean(segment_flatness))
+        mean_zcr = float(np.mean(segment_zcr))
+        mean_centroid = float(np.mean(segment_centroid))
+        mean_bandwidth = float(np.mean(segment_bandwidth))
+        core_hint_ratio = float(
+            np.mean(
+                (segment_rms <= 0.12)
+                & (segment_score >= 0.24)
+                & (segment_zcr >= 0.42)
+                & (segment_centroid >= 0.42)
+            )
+        )
+        follow_mean = float(np.mean(follow_rms)) if len(follow_rms) else mean_rms
+        lead_mean = float(np.mean(lead_rms_segment)) if len(lead_rms_segment) else mean_rms
+        rise_ratio = (follow_mean + 1e-6) / (mean_rms + 1e-6)
+        lead_raw_mean = float(np.mean(lead_raw_segment)) if len(lead_raw_segment) else mean_raw_rms
+        follow_raw_mean = float(np.mean(follow_raw_segment)) if len(follow_raw_segment) else mean_raw_rms
+        lead_raw_p90 = float(np.percentile(lead_raw_segment, 90)) if len(lead_raw_segment) else mean_raw_rms
+        follow_raw_p50 = float(np.percentile(follow_raw_segment, 50)) if len(follow_raw_segment) else mean_raw_rms
+        lead_decay_slope = _linear_slope(lead_raw_segment)
+        seg_shape_slope = _linear_slope(segment_raw_rms)
+        seg_edge_raw = float(
+            np.mean(
+                np.concatenate(
+                    (
+                        segment_raw_rms[: max(1, len(segment_raw_rms) // 6)],
+                        segment_raw_rms[-max(1, len(segment_raw_rms) // 6) :],
+                    )
+                )
+            )
+        )
+        seg_mid_raw = float(np.mean(segment_raw_rms[inner_slice])) if len(segment_raw_rms[inner_slice]) else mean_raw_rms
+        post_phrase_release = (
+            lead_raw_mean >= max(mean_raw_rms * 1.30, global_noise_p35 * 1.45)
+            and lead_decay_slope <= -max(global_noise_p35 * 0.01, 0.0003)
+            and mean_raw_rms <= min(global_voice_p75 * 0.68, global_voice_p87 * 0.52)
+            and mean_score >= max(0.20, relaxed_threshold - 0.02)
+            and mean_zcr >= 0.40
+            and mean_centroid >= 0.40
+            and mean_bandwidth >= 0.42
+            and seg_mid_raw >= max(follow_raw_p50 * 1.08, global_noise_p35 * 1.02)
+            and seg_shape_slope <= max(global_noise_p35 * 0.005, 0.0002)
+        )
+        hard_peak_reject = max_raw_rms > (peak_reject_threshold + 1e-6)
+        hard_percentile_reject = p90_raw_rms > (percentile_reject_threshold + 1e-6)
+        voice_peak_reject = (
+            duration <= 0.50
+            and (
+                hard_peak_reject
+                or hard_percentile_reject
+                or (lead_raw_p90 > 0 and p90_raw_rms >= lead_raw_p90 * 0.92 and mean_raw_rms >= lead_raw_mean * 0.72)
+            )
+            and mean_flatness <= 0.14
+            and core_hint_ratio < 0.30
+        ) or (
+            duration <= 0.50
+            and mean_raw_rms >= global_voice_p75 * 0.95
+            and p90_raw_rms >= global_voice_p87 * 0.80
+            and mean_flatness <= 0.12
+            and core_hint_ratio < 0.30
+        ) or (
+            duration <= 0.50
+            and seg_edge_raw >= seg_mid_raw * 0.92
+            and p90_raw_rms >= global_voice_p75 * 1.05
+            and mean_flatness <= 0.12
+            and core_hint_ratio < 0.28
+        )
+
+        keep = (
+            (0.05 <= duration <= 0.58)
+            and (mean_score >= max(0.18, strict_threshold - 0.06))
+            and (peak_score >= strict_threshold + 0.02)
+            and (texture_score >= max(0.16, noise_floor - 0.02))
+            and (
+                (mean_rms <= min(energy_ceiling * 0.28, 0.16))
+                or (core_hint_ratio >= 0.16 and peak_score >= strict_threshold + 0.06 and duration <= 0.65)
+            )
+            and (
+                (rise_ratio >= max(1.02, 1.55 - sensitivity * 0.04) and follow_mean >= max(mean_rms * 1.05, lead_mean * 0.98, 0.02))
+                or (mean_zcr >= 0.50 and mean_centroid >= 0.48 and mean_rms <= 0.07)
+                or (
+                    duration <= 0.26
+                    and mean_score >= max(0.20, strict_threshold - 0.07)
+                    and mean_zcr >= 0.46
+                    and mean_centroid >= 0.44
+                    and follow_mean >= max(mean_rms * 1.02, 0.018)
+                )
+                or (
+                    duration <= 0.40
+                    and middle_rms <= 0.08
+                    and middle_score >= max(0.27, strict_threshold - 0.01)
+                    and mean_zcr >= 0.44
+                    and mean_centroid >= 0.43
+                )
+                or post_phrase_release
+            )
+            and (lead_mean <= mean_rms * 1.40)
+            and not hard_peak_reject
+            and not hard_percentile_reject
+            and not voice_peak_reject
+            and not (
+                duration <= 0.42
+                and mean_rms >= 0.07
+                and edge_rms >= middle_rms * 1.10
+                and edge_score <= middle_score * 0.92
+                and middle_texture <= texture_score * 0.98
+            )
+            and not (
+                duration <= 0.45
+                and mean_rms >= 0.18
+                and mean_flatness <= 0.12
+                and core_hint_ratio < 0.22
+            )
+            and not (
+                duration <= 0.46
+                and peak_rms >= 0.26
+                and mean_flatness <= 0.11
+                and core_hint_ratio < 0.26
+            )
+            and not (
+                duration <= 0.48
+                and peak_rms >= 0.34
+                and mean_rms >= 0.22
+                and mean_flatness <= 0.12
+                and core_hint_ratio < 0.30
+            )
+        )
+        if keep:
+            scored_segments.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "duration": duration,
+                    "mean_score": mean_score,
+                    "peak_score": peak_score,
+                    "mean_rms": mean_rms,
+                    "rise_ratio": rise_ratio,
+                    "texture_score": texture_score,
+                }
+            )
+
+    scored_segments = _merge_nearby_segments(scored_segments, sr, max_gap=0.12, max_duration=0.62)
+    filtered = []
+    last_end = -1
+    for item in scored_segments:
+        if item["start"] < last_end - int(0.04 * sr):
+            continue
+        filtered.append((item["start"], min(item["end"], len(y))))
+        last_end = item["end"]
+
+    filtered = _expand_segment_edges(
+        filtered,
+        sr,
+        frame_time,
+        relaxed_threshold,
+        energy_ceiling,
+        smoothed_score,
+        rms_norm,
+        zcr_norm,
+        centroid_norm,
+    )
+    filtered = _refine_segment_to_core(
+        filtered,
+        sr,
+        frame_time,
+        smoothed_score,
+        rms_norm,
+        zcr_norm,
+        centroid_norm,
+    )
+    filtered = _trim_segment_heads_tails(
+        filtered,
+        sr,
+        frame_time,
+        smoothed_score,
+        rms_norm,
+        zcr_norm,
+        centroid_norm,
+        bandwidth_norm,
+    )
+    filtered = _extend_breath_edges(
+        filtered,
+        sr,
+        frame_time,
+        smoothed_score,
+        rms_norm,
+        zcr_norm,
+        centroid_norm,
+        bandwidth_norm,
+    )
+
+    durations = [float((end - start) / sr) for start, end in filtered]
+    diagnostics = {
+        "candidate_hits": int(np.count_nonzero(candidate_mask)),
+        "strict_hits": int(np.count_nonzero(strict_mask)),
+        "relaxed_hits": int(np.count_nonzero(relaxed_mask)),
+        "raw_segments": raw_segments,
+        "kept_segments": len(filtered),
+        "max_score": float(np.max(smoothed_score)),
+        "mean_score": float(np.mean(smoothed_score)),
+        "avg_duration": float(np.mean(durations)) if durations else 0.0,
+        "avg_rise_ratio": float(np.mean([item["rise_ratio"] for item in scored_segments])) if scored_segments else 0.0,
+        "smooth_frames": int(smooth_frames),
+        "strict_threshold": float(strict_threshold),
+    }
+    return filtered, diagnostics
+
+
+def _format_diagnostics_text(diagnostics, segment_count):
+    if not diagnostics:
+        return "诊断：未处理"
+    return (
+        f"诊断：候选帧 {diagnostics['candidate_hits']}，"
+        f"严格命中 {diagnostics['strict_hits']}，"
+        f"宽松命中 {diagnostics['relaxed_hits']}，"
+        f"原始片段 {diagnostics['raw_segments']}，"
+        f"最终片段 {segment_count}，"
+        f"最高分 {diagnostics['max_score']:.2f}，"
+        f"平均分 {diagnostics['mean_score']:.2f}，"
+        f"平均时长 {diagnostics['avg_duration']:.2f}s，"
+        f"平均后升比 {diagnostics['avg_rise_ratio']:.2f}，"
+        f"平滑窗口 {diagnostics['smooth_frames']} 帧，"
+        f"严格阈值 {diagnostics['strict_threshold']:.2f}"
+    )
+
+
+def _build_output_path(input_path):
+    source = Path(input_path)
+    return source.with_name(f"{source.stem}_v{VERSION}.mp3")
+
+
+def _write_output_mp3(y_processed, sr, output_path):
+    temp_wav = tempfile.NamedTemporaryFile(prefix="breath_processed_", suffix=".wav", delete=False)
+    temp_wav.close()
+    sf.write(temp_wav.name, y_processed, sr)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                temp_wav.name,
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(output_path),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        if os.path.exists(temp_wav.name):
+            os.remove(temp_wav.name)
+
+
+def process_breath(input_path, atten_db=18, sensitivity=7, peak_reject_threshold=0.20, percentile_reject_threshold=0.20):
+    try:
+        y, sr = librosa.load(input_path, sr=None, mono=True)
+        y_processed = y.copy()
+
+        breath_segments, diagnostics = _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold, percentile_reject_threshold)
+        gain = np.power(10, -atten_db / 20)
+        for start, end in breath_segments:
+            start = max(0, start)
+            end = min(end, len(y_processed))
+            if end <= start:
+                continue
+            segment = np.asarray(y_processed[start:end], dtype=np.float32)
+            env_window = max(8, int(0.008 * sr))
+            local_env = _moving_average(np.abs(segment), env_window)
+            env_low = float(np.percentile(local_env, 15))
+            env_high = float(np.percentile(local_env, 88))
+            env_norm = np.clip((local_env - env_low) / (env_high - env_low + 1e-6), 0.0, 1.0)
+
+            # 片段内部按能量自适应衰减：越像轻气声衰减越多，越像句首句尾的人声越少动。
+            x = np.linspace(-1.0, 1.0, len(segment), dtype=np.float32)
+            center_shape = np.sqrt(np.clip(1.0 - x * x, 0.0, 1.0))
+            breath_focus = (0.38 + 0.62 * center_shape) * np.power(env_norm, 0.74)
+            breath_focus = np.clip(breath_focus, 0.0, 1.0)
+            envelope = 1.0 - (1.0 - gain) * np.power(breath_focus, 0.86)
+            envelope = np.minimum(envelope, 0.86 - 0.14 * center_shape)
+
+            fade_len = min(int(0.020 * sr), max((end - start) // 6, 1))
+            if fade_len > 1 and len(envelope) > fade_len * 2:
+                edge_protect = np.zeros_like(envelope)
+                edge_protect[:fade_len] = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+                edge_protect[-fade_len:] = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                envelope = envelope + (1.0 - envelope) * edge_protect * 0.03
+
+            y_processed[start:end] *= envelope.astype(np.float32)
+
+        output_path = _build_output_path(input_path)
+        if output_path.exists():
+            output_path.unlink()
+        _write_output_mp3(y_processed, sr, output_path)
+
+        return {
+            "source_audio": y,
+            "output_audio": y_processed,
+            "sr": sr,
+            "segments": breath_segments,
+            "diagnostics": diagnostics,
+            "output_path": str(output_path),
+        }
+    except Exception as exc:
+        raise RuntimeError(f"处理失败：{exc}") from exc
+
+
+class BreathReducerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"清唱吸气声弱化工具 v{VERSION}")
+        self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+        self.root.resizable(True, True)
+
+        self.input_path = ""
+        self.output_path = ""
+        self.source_audio = None
+        self.output_audio = None
+        self.sr = None
+        self.segments = []
+        self.selected_segment_index = None
+        self.last_diagnostics = None
+        self.player_process = None
+        self.playback_temp_path = None
+        self.playback_job = None
+        self.playback_start_wall_time = None
+        self.playback_start_audio_time = None
+        self.playback_duration = None
+        self.playback_plot_kind = "source"
+        self.is_paused = False
+        self.debug_text = tk.StringVar(value="诊断：未处理")
+        self.peak_reject_var = tk.StringVar(value="0.20")
+        self.percentile_reject_var = tk.StringVar(value="0.20")
+        self.active_plot = "source"
+        self.selected_time_sec = None
+        self.selection_mode = False
+        self.pick_detected_segment_mode = False
+        self.picked_detected_segments = []
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+        self.selected_ranges = []
+        self.current_view_start = 0.0
+        self.current_view_duration = 8.0
+
+        self._build_controls()
+        self._build_plot()
+        self.root.after(150, self.bring_to_front)
+
+    def _build_controls(self):
+        top = ttk.Frame(self.root, padding=12)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="选择清唱音频：").grid(row=0, column=0, sticky="w")
+        self.file_label = ttk.Label(top, text="未选择文件", foreground="gray")
+        self.file_label.grid(row=0, column=1, sticky="w", padx=(8, 12))
+        ttk.Button(top, text="浏览", command=self.select_file).grid(row=0, column=2, padx=6)
+
+        ttk.Label(top, text="衰减强度：").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        self.atten_slider = tk.Scale(top, from_=10, to=30, orient=tk.HORIZONTAL, length=220)
+        self.atten_slider.set(30)
+        self.atten_slider.grid(row=1, column=1, sticky="w", pady=(10, 0))
+
+        ttk.Label(top, text="检测灵敏度：").grid(row=1, column=2, sticky="w", pady=(10, 0))
+        self.sensitivity_slider = tk.Scale(top, from_=1, to=10, orient=tk.HORIZONTAL, length=220)
+        self.sensitivity_slider.set(10)
+        self.sensitivity_slider.grid(row=1, column=3, sticky="w", pady=(10, 0))
+
+        ttk.Label(top, text="吸气最大峰值：").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.peak_reject_entry = ttk.Entry(top, textvariable=self.peak_reject_var, width=10)
+        self.peak_reject_entry.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="片段内允许的最高瞬时音量；超过就更像正常人声", foreground="gray").grid(row=2, column=1, sticky="e", padx=(0, 90), pady=(10, 0))
+
+        ttk.Label(top, text="吸气最大整体音量：").grid(row=2, column=2, sticky="w", pady=(10, 0))
+        self.percentile_reject_entry = ttk.Entry(top, textvariable=self.percentile_reject_var, width=10)
+        self.percentile_reject_entry.grid(row=2, column=3, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="片段整体音量上限；超过就更像整段人声而不是吸气", foreground="gray").grid(row=2, column=3, sticky="e", padx=(0, 90), pady=(10, 0))
+
+        buttons = ttk.Frame(top)
+        buttons.grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        self.process_btn = ttk.Button(buttons, text="重新处理当前文件", command=self.run_process, state=tk.DISABLED)
+        self.process_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.play_output_btn = ttk.Button(buttons, text="播放处理后整段", command=self.play_output_audio, state=tk.DISABLED)
+        self.play_output_btn.pack(side=tk.LEFT, padx=8)
+        self.play_source_segment_btn = ttk.Button(buttons, text="播放源片段", command=lambda: self.play_selected_segment(False), state=tk.DISABLED)
+        self.play_source_segment_btn.pack(side=tk.LEFT, padx=8)
+        self.play_output_segment_btn = ttk.Button(buttons, text="播放输出片段", command=lambda: self.play_selected_segment(True), state=tk.DISABLED)
+        self.play_output_segment_btn.pack(side=tk.LEFT, padx=8)
+        self.play_active_source_btn = ttk.Button(buttons, text="播放原文件", command=lambda: self.toggle_active_playback(False), state=tk.DISABLED)
+        self.play_active_source_btn.pack(side=tk.LEFT, padx=8)
+        self.play_active_output_btn = ttk.Button(buttons, text="播放输出文件", command=lambda: self.toggle_active_playback(True), state=tk.DISABLED)
+        self.play_active_output_btn.pack(side=tk.LEFT, padx=8)
+        self.selection_mode_btn = ttk.Button(buttons, text="开启区间选择", command=self.toggle_selection_mode, state=tk.DISABLED)
+        self.selection_mode_btn.pack(side=tk.LEFT, padx=8)
+        self.pick_segment_btn = ttk.Button(buttons, text="选中处理片段", command=self.toggle_pick_detected_segment_mode, state=tk.DISABLED)
+        self.pick_segment_btn.pack(side=tk.LEFT, padx=8)
+        self.clear_selection_btn = ttk.Button(buttons, text="清空选区", command=self.clear_selected_ranges, state=tk.DISABLED)
+        self.clear_selection_btn.pack(side=tk.LEFT, padx=8)
+        self.zoom_in_btn = ttk.Button(buttons, text="放大长度", command=lambda: self.adjust_zoom(0.5), state=tk.DISABLED)
+        self.zoom_in_btn.pack(side=tk.LEFT, padx=8)
+        self.zoom_out_btn = ttk.Button(buttons, text="缩小长度", command=lambda: self.adjust_zoom(2.0), state=tk.DISABLED)
+        self.zoom_out_btn.pack(side=tk.LEFT, padx=8)
+        self.reset_zoom_btn = ttk.Button(buttons, text="重置长度", command=self.reset_zoom, state=tk.DISABLED)
+        self.reset_zoom_btn.pack(side=tk.LEFT, padx=8)
+
+        self.status_label = ttk.Label(top, text="状态：等待操作", foreground="blue")
+        self.status_label.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        self.diagnostic_button = tk.Button(
+            top,
+            textvariable=self.debug_text,
+            command=self.copy_diagnostics,
+            anchor="w",
+            justify=tk.LEFT,
+            relief=tk.FLAT,
+            fg="#1f4e79",
+            wraplength=1120,
+            cursor="hand2",
+        )
+        self.diagnostic_button.grid(row=5, column=0, columnspan=4, sticky="we", pady=(8, 0))
+
+    def _build_plot(self):
+        plot_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+        plot_frame.pack(fill=tk.BOTH, expand=True)
+
+        source_frame = ttk.Frame(plot_frame)
+        source_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        output_frame = ttk.Frame(plot_frame)
+        output_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.figure_source = Figure(figsize=(11, 3.2), dpi=100)
+        self.ax_source = self.figure_source.add_subplot(111)
+        self.figure_source.tight_layout(pad=2.0)
+        self.canvas_source = FigureCanvasTkAgg(self.figure_source, master=source_frame)
+        self.canvas_source.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_source.mpl_connect("button_press_event", lambda event: self.on_plot_press(event, "source"))
+        self.canvas_source.mpl_connect("button_release_event", lambda event: self.on_plot_release(event, "source"))
+
+        self.source_scroll = tk.Scale(
+            source_frame,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            command=lambda value: self.on_scroll("source", value),
+            state=tk.DISABLED,
+        )
+        self.source_scroll.pack(fill=tk.X)
+
+        self.figure_output = Figure(figsize=(11, 3.2), dpi=100)
+        self.ax_output = self.figure_output.add_subplot(111)
+        self.figure_output.tight_layout(pad=2.0)
+        self.canvas_output = FigureCanvasTkAgg(self.figure_output, master=output_frame)
+        self.canvas_output.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas_output.mpl_connect("button_press_event", lambda event: self.on_plot_press(event, "output"))
+        self.canvas_output.mpl_connect("button_release_event", lambda event: self.on_plot_release(event, "output"))
+
+        self.output_scroll = tk.Scale(
+            output_frame,
+            from_=0,
+            to=100,
+            orient=tk.HORIZONTAL,
+            showvalue=False,
+            command=lambda value: self.on_scroll("output", value),
+            state=tk.DISABLED,
+        )
+        self.output_scroll.pack(fill=tk.X)
+
+        self._draw_placeholder()
+
+    def _draw_placeholder(self):
+        for ax, canvas, title in (
+            (self.ax_source, self.canvas_source, "源文件音量谱"),
+            (self.ax_output, self.canvas_output, "输出文件音量谱"),
+        ):
+            ax.clear()
+            ax.set_title(title)
+            ax.set_xlabel("时间 (秒)")
+            ax.set_ylabel("音量")
+            ax.text(0.5, 0.5, "处理后显示音量谱与吸气片段", transform=ax.transAxes, ha="center", va="center", color="gray")
+            canvas.draw_idle()
+
+    def select_file(self):
+        path = filedialog.askopenfilename(
+            title="选择清唱音频",
+            filetypes=[("音频文件", "*.wav *.mp3 *.m4a *.flac"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        self.input_path = path
+        self.file_label.config(text=os.path.basename(path), foreground="green")
+        self.process_btn.config(state=tk.NORMAL)
+        self.status_label.config(text="状态：已选择文件，正在自动处理...", foreground="orange")
+        self.root.update()
+        self.run_process()
+
+    def run_process(self):
+        if not self.input_path:
+            messagebox.showwarning("提示", "请先选择音频文件")
+            return
+
+        self.status_label.config(text="状态：正在识别并生成输出 MP3...", foreground="orange")
+        self.root.update()
+
+        try:
+            peak_reject_threshold = float(self.peak_reject_var.get())
+            percentile_reject_threshold = float(self.percentile_reject_var.get())
+        except ValueError:
+            messagebox.showwarning("提示", "吸气最大峰值和吸气最大整体音量需要填写数字")
+            return
+
+        try:
+            result = process_breath(
+                self.input_path,
+                self.atten_slider.get(),
+                self.sensitivity_slider.get(),
+                peak_reject_threshold,
+                percentile_reject_threshold,
+            )
+        except RuntimeError as exc:
+            self.status_label.config(text="状态：处理失败", foreground="red")
+            messagebox.showerror("错误", str(exc))
+            return
+
+        self.source_audio = result["source_audio"]
+        self.output_audio = result["output_audio"]
+        self.sr = result["sr"]
+        self.segments = result["segments"]
+        self.output_path = result["output_path"]
+        self.last_diagnostics = result["diagnostics"]
+        self.selected_segment_index = 0 if self.segments else None
+        self.selected_time_sec = (self.segments[0][0] / self.sr) if self.segments else 0.0
+        self.selected_ranges = []
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+        total_duration = len(self.source_audio) / self.sr if self.source_audio is not None else 0.0
+        self.current_view_start = 0.0
+        self.current_view_duration = min(8.0, total_duration) if total_duration else 8.0
+
+        self.debug_text.set(_format_diagnostics_text(self.last_diagnostics, len(self.segments)))
+        self.status_label.config(
+            text=f"状态：处理完成，输出文件已生成：{os.path.basename(self.output_path)}",
+            foreground="green",
+        )
+        self.play_output_btn.config(state=tk.NORMAL if self.output_path else tk.DISABLED)
+        segment_state = tk.NORMAL if self.segments else tk.DISABLED
+        self.play_source_segment_btn.config(state=segment_state)
+        self.play_output_segment_btn.config(state=segment_state)
+        click_play_state = tk.NORMAL if self.source_audio is not None else tk.DISABLED
+        self.play_active_source_btn.config(state=click_play_state)
+        self.play_active_output_btn.config(state=click_play_state)
+        self.selection_mode_btn.config(state=click_play_state)
+        self.pick_segment_btn.config(state=click_play_state)
+        self.clear_selection_btn.config(state=click_play_state)
+        zoom_state = tk.NORMAL if self.source_audio is not None else tk.DISABLED
+        self.zoom_in_btn.config(state=zoom_state)
+        self.zoom_out_btn.config(state=zoom_state)
+        self.reset_zoom_btn.config(state=zoom_state)
+        self.source_scroll.config(state=zoom_state)
+        self.output_scroll.config(state=zoom_state)
+        self._update_selection_buttons()
+        self._update_play_toggle_buttons()
+        self.refresh_plots()
+
+    def _compute_envelope(self, audio):
+        if audio is None or self.sr is None:
+            return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)
+        envelope = librosa.feature.rms(y=audio, frame_length=2048, hop_length=HOP_LENGTH)[0]
+        times = librosa.times_like(envelope, sr=self.sr, hop_length=HOP_LENGTH)
+        return times, envelope
+
+    def _draw_wave_envelope(self, ax, audio, title, active=False):
+        ax.clear()
+        if audio is None or self.sr is None:
+            ax.set_title(title)
+            return
+        duration = len(audio) / self.sr
+        times, envelope = self._compute_envelope(audio)
+        ax.plot(times, envelope, color="#2d6cdf", linewidth=1.2)
+        ax.fill_between(times, 0, envelope, color="#8cb7ff", alpha=0.35)
+        ax.set_title(f"{title}{'  [当前选择]' if active else ''}")
+        ax.set_ylabel("音量")
+        ax.set_ylim(bottom=0)
+
+        try:
+            peak_line = float(self.peak_reject_var.get())
+            percentile_line = float(self.percentile_reject_var.get())
+        except ValueError:
+            peak_line = 0.20
+            percentile_line = 0.20
+        if len(envelope):
+            ax.axhline(
+                peak_line,
+                color="#ff8a00",
+                linestyle="--",
+                linewidth=1.1,
+                alpha=0.85,
+                label=f"最大峰值 {peak_line:.2f}",
+            )
+            ax.axhline(
+                percentile_line,
+                color="#ffd400",
+                linestyle="--",
+                linewidth=1.1,
+                alpha=0.85,
+                label=f"最大整体音量 {percentile_line:.2f}",
+            )
+            ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+        picked_set = set(self.picked_detected_segments)
+        for index, (start, end) in enumerate(self.segments):
+            start_sec = start / self.sr
+            end_sec = end / self.sr
+            alpha = 0.45 if index in picked_set else (0.32 if index == self.selected_segment_index else 0.18)
+            edge_color = "#ff7f50" if index in picked_set else ("#00ff66" if index != self.selected_segment_index else "#f7ff00")
+            ax.axvspan(start_sec, end_sec, color="#00ff66", alpha=alpha, ec=edge_color, lw=2)
+
+        for start_sec, end_sec in self.selected_ranges:
+            ax.axvspan(start_sec, end_sec, color="#5aa9ff", alpha=0.22, ec="#1f6feb", lw=2)
+
+        if self.selected_time_sec is not None:
+            ax.axvline(self.selected_time_sec, color="#ff5a36", linewidth=1.5, linestyle="--")
+
+        if self.selection_mode and self.drag_start_sec is not None:
+            ax.axvline(self.drag_start_sec, color="#8a2be2", linewidth=1.2, linestyle=":")
+
+        if duration > 0:
+            view_duration = min(self.current_view_duration, duration)
+            max_start = max(0.0, duration - view_duration)
+            self.current_view_start = min(max(self.current_view_start, 0.0), max_start)
+            ax.set_xlim(self.current_view_start, self.current_view_start + view_duration)
+
+    def refresh_plots(self):
+        self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source")
+        self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output")
+        self.ax_output.set_xlabel("时间 (秒)")
+        self.ax_source.set_xlabel("时间 (秒)")
+        self.canvas_source.draw_idle()
+        self.canvas_output.draw_idle()
+        self.sync_scrollbars()
+
+    def sync_scrollbars(self):
+        if self.source_audio is None or self.sr is None:
+            return
+        total_duration = len(self.source_audio) / self.sr
+        max_start = max(0.0, total_duration - self.current_view_duration)
+        value = 0 if max_start <= 0 else (self.current_view_start / max_start) * 100
+        self.source_scroll.set(value)
+        self.output_scroll.set(value)
+
+    def on_scroll(self, _which, value):
+        if self.source_audio is None or self.sr is None:
+            return
+        total_duration = len(self.source_audio) / self.sr
+        max_start = max(0.0, total_duration - self.current_view_duration)
+        if max_start <= 0:
+            self.current_view_start = 0.0
+        else:
+            self.current_view_start = (float(value) / 100.0) * max_start
+        self.refresh_plots()
+
+    def adjust_zoom(self, factor):
+        if self.source_audio is None or self.sr is None:
+            return
+        total_duration = len(self.source_audio) / self.sr
+        new_duration = np.clip(self.current_view_duration * factor, 0.8, max(0.8, total_duration))
+        if self.selected_segment_index is not None and self.segments:
+            start, end = self.segments[self.selected_segment_index]
+            center = ((start + end) / 2) / self.sr
+            self.current_view_start = center - new_duration / 2
+        self.current_view_duration = float(new_duration)
+        self.refresh_plots()
+
+    def reset_zoom(self):
+        if self.source_audio is None or self.sr is None:
+            return
+        total_duration = len(self.source_audio) / self.sr
+        self.current_view_start = 0.0
+        self.current_view_duration = min(8.0, total_duration) if total_duration else 8.0
+        self.refresh_plots()
+
+    def on_plot_press(self, event, plot_kind):
+        if event.xdata is None or self.sr is None:
+            return
+
+        if self.selection_mode:
+            self.active_plot = plot_kind
+            self.drag_start_sec = float(event.xdata)
+            self.drag_plot_kind = plot_kind
+            self.selected_time_sec = float(event.xdata)
+            self.status_label.config(
+                text=f"状态：开始选择{('源文件' if plot_kind == 'source' else '输出文件')}区间，起点 {self.drag_start_sec:.2f}s",
+                foreground="purple",
+            )
+            self.refresh_plots()
+            return
+
+        self.on_plot_click(event, plot_kind)
+
+    def on_plot_release(self, event, plot_kind):
+        if not self.selection_mode or self.drag_start_sec is None or self.sr is None:
+            return
+        if event.xdata is None:
+            self.drag_start_sec = None
+            self.drag_plot_kind = None
+            self.refresh_plots()
+            return
+
+        start_sec = min(self.drag_start_sec, float(event.xdata))
+        end_sec = max(self.drag_start_sec, float(event.xdata))
+        if abs(end_sec - start_sec) < 0.005:
+            end_sec = min(start_sec + 0.005, len(self.source_audio) / self.sr if self.source_audio is not None else start_sec + 0.005)
+
+        self.selected_ranges.append((start_sec, end_sec))
+        self.selected_ranges.sort(key=lambda item: item[0])
+        self.selected_time_sec = start_sec
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+        self._update_selection_buttons()
+        self.status_label.config(
+            text=f"状态：已添加选区 {start_sec:.2f}s - {end_sec:.2f}s，可继续拖拽选择下一段",
+            foreground="purple",
+        )
+        self.refresh_plots()
+
+    def on_plot_click(self, event, plot_kind):
+        if event.xdata is None or self.sr is None:
+            return
+
+        self.active_plot = plot_kind
+        clicked_time = float(event.xdata)
+        self.selected_time_sec = clicked_time
+        best_index = None
+        best_distance = float("inf")
+        for index, (start, end) in enumerate(self.segments):
+            start_sec = start / self.sr
+            end_sec = end / self.sr
+            if start_sec <= clicked_time <= end_sec:
+                best_index = index
+                break
+            distance = min(abs(clicked_time - start_sec), abs(clicked_time - end_sec))
+            if distance < best_distance and distance <= 0.20:
+                best_index = index
+                best_distance = distance
+
+        if self.pick_detected_segment_mode:
+            if best_index is None:
+                self.status_label.config(text="状态：未点中绿色处理片段，请再试一次", foreground="purple")
+                return
+            if best_index not in self.picked_detected_segments:
+                self.picked_detected_segments.append(best_index)
+            start, end = self.segments[best_index]
+            self.selected_segment_index = best_index
+            self.status_label.config(
+                text=f"状态：已加入处理片段 {int(round(start / self.sr * 1000))}-{int(round(end / self.sr * 1000))}，继续点绿色片段或点“选择完成”",
+                foreground="purple",
+            )
+            self.current_view_start = clicked_time - self.current_view_duration / 2
+            self.refresh_plots()
+            return
+
+        if best_index is None:
+            self.selected_segment_index = None
+            self.status_label.config(
+                text=f"状态：已选中{('源文件' if plot_kind == 'source' else '输出文件')} {clicked_time:.2f}s，从该处开始播放",
+                foreground="blue",
+            )
+            self.current_view_start = clicked_time - self.current_view_duration / 2
+            self.refresh_plots()
+            return
+
+        self.selected_segment_index = best_index
+        start, end = self.segments[best_index]
+        self.status_label.config(
+            text=f"状态：已选中{('源文件' if plot_kind == 'source' else '输出文件')} {clicked_time:.2f}s，所在片段 {best_index + 1}，范围 {start / self.sr:.2f}s - {end / self.sr:.2f}s",
+            foreground="blue",
+        )
+        self.current_view_start = clicked_time - self.current_view_duration / 2
+        self.refresh_plots()
+
+    def toggle_selection_mode(self):
+        if not self.selection_mode:
+            self.selection_mode = True
+            self.pick_detected_segment_mode = False
+            self.pick_segment_btn.config(text="选中处理片段")
+            self.picked_detected_segments = []
+            self.drag_start_sec = None
+            self.drag_plot_kind = None
+            self.selection_mode_btn.config(text="输出选中时间")
+            self.status_label.config(
+                text="状态：区间选择模式已开启，拖拽鼠标可选多段；完成后点“输出选中时间”",
+                foreground="purple",
+            )
+        else:
+            self.selection_mode = False
+            self.drag_start_sec = None
+            self.drag_plot_kind = None
+            text = self._format_selected_time_ranges()
+            if text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update()
+                self.status_label.config(text=f"状态：已复制并清空选区：{text}", foreground="blue")
+            else:
+                self.status_label.config(text="状态：当前没有选区可输出", foreground="blue")
+            self.selected_ranges = []
+            self.selection_mode_btn.config(text="开启区间选择")
+        self.refresh_plots()
+
+    def toggle_pick_detected_segment_mode(self):
+        if not self.pick_detected_segment_mode:
+            self.pick_detected_segment_mode = True
+            self.picked_detected_segments = []
+            self.selection_mode = False
+            self.selection_mode_btn.config(text="开启区间选择")
+            self.pick_segment_btn.config(text="选择完成")
+            self.status_label.config(
+                text="状态：选中处理片段模式已开启，点击绿色片段可累计选择，完成后再点“选择完成”",
+                foreground="purple",
+            )
+        else:
+            self.pick_detected_segment_mode = False
+            self.pick_segment_btn.config(text="选中处理片段")
+            if self.picked_detected_segments and self.sr is not None:
+                items = []
+                for idx in self.picked_detected_segments:
+                    start, end = self.segments[idx]
+                    items.append(f"{int(round(start / self.sr * 1000))}-{int(round(end / self.sr * 1000))}")
+                text = ",".join(items)
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update()
+                self.status_label.config(text=f"状态：已复制所选处理片段到剪贴板：{text}", foreground="purple")
+            else:
+                self.status_label.config(text="状态：未选中任何处理片段", foreground="blue")
+        self.refresh_plots()
+
+    def clear_selected_ranges(self):
+        self.selected_ranges = []
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+        self._update_selection_buttons()
+        self.status_label.config(text="状态：已清空所有选区", foreground="blue")
+        self.refresh_plots()
+
+    def _update_selection_buttons(self):
+        return
+
+    def _format_selected_time_ranges(self):
+        if not self.selected_ranges:
+            return ""
+        parts = []
+        for start_sec, end_sec in self.selected_ranges:
+            start_ms = int(round(start_sec * 1000))
+            end_ms = int(round(end_sec * 1000))
+            parts.append(f"{start_ms}-{end_ms}")
+        return ",".join(parts)
+
+    def bring_to_front(self):
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.root.after(500, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
+    def copy_diagnostics(self):
+        text = self.debug_text.get()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.status_label.config(text="状态：诊断信息已复制到剪贴板", foreground="blue")
+
+    def _stop_player(self):
+        if self.playback_job is not None:
+            self.root.after_cancel(self.playback_job)
+            self.playback_job = None
+        self.playback_start_wall_time = None
+        self.playback_start_audio_time = None
+        self.playback_duration = None
+        self.is_paused = False
+        if self.player_process and self.player_process.poll() is None:
+            self.player_process.terminate()
+        self.player_process = None
+        if self.playback_temp_path and os.path.exists(self.playback_temp_path):
+            try:
+                os.remove(self.playback_temp_path)
+            except OSError:
+                pass
+        self.playback_temp_path = None
+        self._update_play_toggle_buttons()
+
+    def _play_file(self, path):
+        self._stop_player()
+        self.player_process = subprocess.Popen(["afplay", path])
+        self._update_play_toggle_buttons()
+
+    def _start_playback_tracking(self, start_time_sec, duration_sec, plot_kind):
+        self.playback_start_wall_time = self.root.winfo_toplevel().tk.call("clock", "milliseconds")
+        self.playback_start_audio_time = float(start_time_sec)
+        self.playback_duration = float(duration_sec)
+        self.playback_plot_kind = plot_kind
+        self.active_plot = plot_kind
+        self.is_paused = False
+        self._update_play_toggle_buttons()
+        self._schedule_playback_tick()
+
+    def _schedule_playback_tick(self):
+        if self.playback_start_wall_time is None or self.playback_start_audio_time is None:
+            return
+        if self.is_paused:
+            self.playback_job = self.root.after(50, self._schedule_playback_tick)
+            return
+
+        now_ms = int(self.root.winfo_toplevel().tk.call("clock", "milliseconds"))
+        elapsed = max(0.0, (now_ms - self.playback_start_wall_time) / 1000.0)
+        if self.playback_duration is not None and elapsed > self.playback_duration:
+            self.selected_time_sec = self.playback_start_audio_time + self.playback_duration
+            self.refresh_plots()
+            self.playback_job = None
+            self._update_play_toggle_buttons()
+            return
+
+        self.selected_time_sec = self.playback_start_audio_time + elapsed
+        self.current_view_start = self.selected_time_sec - self.current_view_duration / 2
+        self.refresh_plots()
+        self.playback_job = self.root.after(50, self._schedule_playback_tick)
+
+    def play_output_audio(self):
+        if not self.output_path or not os.path.exists(self.output_path):
+            messagebox.showwarning("提示", "输出文件不存在，请先处理")
+            return
+        self._play_file(self.output_path)
+
+    def play_active_selection(self, processed):
+        if self.selected_time_sec is None or self.sr is None:
+            messagebox.showwarning("提示", "请先点击图上的位置")
+            return
+
+        audio = self.output_audio if processed else self.source_audio
+        if audio is None:
+            return
+
+        start_sample = int(max(0, self.selected_time_sec) * self.sr)
+        if start_sample >= len(audio):
+            return
+
+        end_sample = len(audio)
+        clip = audio[start_sample:end_sample]
+        if len(clip) == 0:
+            return
+
+        self._stop_player()
+        temp_audio = tempfile.NamedTemporaryFile(prefix="breath_cursor_long_", suffix=".wav", delete=False)
+        temp_audio.close()
+        sf.write(temp_audio.name, np.asarray(clip, dtype=np.float32), self.sr)
+        self.playback_temp_path = temp_audio.name
+        self.player_process = subprocess.Popen(["afplay", temp_audio.name])
+        self._start_playback_tracking(
+            self.selected_time_sec,
+            len(clip) / self.sr,
+            "output" if processed else "source",
+        )
+
+    def _resume_active_playback(self):
+        resume_from = self.selected_time_sec if self.selected_time_sec is not None else self.playback_start_audio_time
+        audio = self.output_audio if self.playback_plot_kind == "output" else self.source_audio
+        if audio is None or self.sr is None:
+            return
+        start_sample = int(max(0, resume_from) * self.sr)
+        clip = audio[start_sample:]
+        if len(clip) == 0:
+            return
+        if self.playback_temp_path and os.path.exists(self.playback_temp_path):
+            try:
+                os.remove(self.playback_temp_path)
+            except OSError:
+                pass
+        temp_audio = tempfile.NamedTemporaryFile(prefix="breath_cursor_resume_", suffix=".wav", delete=False)
+        temp_audio.close()
+        sf.write(temp_audio.name, np.asarray(clip, dtype=np.float32), self.sr)
+        self.playback_temp_path = temp_audio.name
+        self.player_process = subprocess.Popen(["afplay", temp_audio.name])
+        now_ms = int(self.root.winfo_toplevel().tk.call("clock", "milliseconds"))
+        self.playback_start_wall_time = now_ms
+        self.playback_start_audio_time = resume_from
+        self.playback_duration = len(clip) / self.sr
+        self.is_paused = False
+        self._update_play_toggle_buttons()
+
+    def _pause_active_playback(self):
+        if self.player_process and self.player_process.poll() is None:
+            self.player_process.terminate()
+        self.player_process = None
+        self.is_paused = True
+        self._update_play_toggle_buttons()
+
+    def _update_play_toggle_buttons(self):
+        source_text = "播放原文件"
+        output_text = "播放输出文件"
+        if self.playback_plot_kind == "source" and self.playback_start_audio_time is not None:
+            source_text = "暂停原文件" if not self.is_paused else "继续原文件"
+        if self.playback_plot_kind == "output" and self.playback_start_audio_time is not None:
+            output_text = "暂停输出文件" if not self.is_paused else "继续输出文件"
+        self.play_active_source_btn.config(text=source_text)
+        self.play_active_output_btn.config(text=output_text)
+
+    def toggle_active_playback(self, processed):
+        target = "output" if processed else "source"
+        if self.playback_plot_kind == target and self.playback_start_audio_time is not None:
+            if self.is_paused:
+                self._resume_active_playback()
+                self.status_label.config(text=f"状态：继续播放{('输出文件' if processed else '原文件')}", foreground="blue")
+            else:
+                self._pause_active_playback()
+                self.status_label.config(text=f"状态：已暂停{('输出文件' if processed else '原文件')}", foreground="blue")
+            return
+        self.play_active_selection(processed)
+        self.status_label.config(text=f"状态：开始从当前选中位置播放{('输出文件' if processed else '原文件')}", foreground="blue")
+
+    def play_selected_segment(self, processed):
+        if self.selected_segment_index is None or self.sr is None:
+            messagebox.showwarning("提示", "请先点击绿色片段")
+            return
+
+        audio = self.output_audio if processed else self.source_audio
+        if audio is None:
+            return
+
+        start, end = self.segments[self.selected_segment_index]
+        clip = audio[start:end]
+        if len(clip) == 0:
+            return
+
+        temp_audio = tempfile.NamedTemporaryFile(prefix="breath_clip_", suffix=".wav", delete=False)
+        temp_audio.close()
+        sf.write(temp_audio.name, clip, self.sr)
+        self._play_file(temp_audio.name)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BreathReducerApp(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app._stop_player(), root.destroy()))
+    root.mainloop()
