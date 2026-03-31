@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 57
+VERSION = 58
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -578,7 +578,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
 
         seg_smooth = _moving_average(seg_raw, 3)
         follow_smooth = _moving_average(follow_raw, 3)
-        tail_len = max(4, len(seg_smooth) // 3)
+        tail_len = max(4, len(seg_smooth) // 6)
         tail = seg_smooth[-tail_len:]
         combined = np.concatenate((tail, follow_smooth))
         if len(combined) < 5:
@@ -598,12 +598,17 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
         )
 
         best_valley_idx = None
+        seg_tail_offset = len(seg_smooth) - len(tail)
+        min_allowed_cut = max(1, int(round(len(seg_smooth) * 0.90)))
         for idx in range(1, len(combined) - 2):
             cur = float(combined[idx])
             prev = float(combined[idx - 1])
             nxt = float(combined[idx + 1])
             nxt2 = float(combined[idx + 2])
+            candidate_seg_idx = seg_tail_offset + idx if idx < len(tail) else len(seg_smooth) - 1
             if (
+                candidate_seg_idx >= min_allowed_cut
+                and
                 cur <= valley_limit
                 and cur <= prev + 1e-6
                 and cur <= nxt + 1e-6
@@ -618,13 +623,12 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_flo
             snapped.append((start, end))
             continue
 
-        tail_offset = len(seg_smooth) - len(tail)
         if best_valley_idx < len(tail):
-            cut_idx = tail_offset + best_valley_idx
+            cut_idx = seg_tail_offset + best_valley_idx
         else:
             cut_idx = len(seg_smooth) - 1
 
-        cut_idx = max(1, min(cut_idx, len(seg_smooth) - 1))
+        cut_idx = max(min_allowed_cut, min(cut_idx, len(seg_smooth) - 1))
         new_end_frame = start_frame + cut_idx
         new_end = int(new_end_frame * frame_time * sr)
         if new_end - start >= int(0.04 * sr):
