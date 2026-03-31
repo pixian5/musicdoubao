@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 55
+VERSION = 56
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -495,7 +495,7 @@ def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_t
     if not segments:
         return trimmed
 
-    look_ahead_frames = max(3, int(round(0.10 / frame_time)))
+    look_ahead_frames = max(3, int(round(0.12 / frame_time)))
     for start, end in segments:
         start_frame = max(0, int(start / HOP_LENGTH))
         end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
@@ -507,27 +507,34 @@ def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_t
 
         seg_smooth = _moving_average(seg_raw, 3)
         follow_smooth = _moving_average(follow_raw, 3)
+        combined = np.concatenate(
+            (
+                seg_smooth[max(0, len(seg_smooth) - max(4, len(seg_smooth) // 3)) :],
+                follow_smooth,
+            )
+        )
         seg_floor = float(np.percentile(seg_smooth, 25))
         seg_tail = float(np.percentile(seg_smooth[max(0, len(seg_smooth) - max(2, len(seg_smooth) // 4)) :], 70))
         voice_gate = max(
-            seg_floor * 2.0,
-            seg_tail * 1.18,
+            seg_floor * 1.75,
+            seg_tail * 1.08,
             voice_floor_threshold * 1.30 if voice_floor_threshold > 0 else 0.0,
-            percentile_reject_threshold * 0.55,
-            peak_reject_threshold * 0.45,
-            0.012,
+            percentile_reject_threshold * 0.48,
+            peak_reject_threshold * 0.40,
+            0.010,
         )
 
         onset_idx = None
-        for idx in range(0, len(follow_smooth) - 2):
-            a = float(follow_smooth[idx])
-            b = float(follow_smooth[idx + 1])
-            c = float(follow_smooth[idx + 2])
+        tail_offset = len(combined) - len(follow_smooth)
+        for idx in range(0, len(combined) - 2):
+            a = float(combined[idx])
+            b = float(combined[idx + 1])
+            c = float(combined[idx + 2])
             if (
                 a >= voice_gate
-                and b >= a * 1.03
-                and c >= b * 1.02
-                and max(a, b, c) >= max(percentile_reject_threshold * 0.70, peak_reject_threshold * 0.56, voice_gate * 1.05)
+                and b >= a * 1.015
+                and c >= b * 1.01
+                and max(a, b, c) >= max(percentile_reject_threshold * 0.60, peak_reject_threshold * 0.50, voice_gate * 1.03)
             ):
                 onset_idx = idx
                 break
@@ -536,10 +543,10 @@ def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_t
             trimmed.append((start, end))
             continue
 
-        back_window_start = max(0, len(seg_smooth) - max(3, len(seg_smooth) // 3))
-        back_cut = len(seg_smooth) - 1
-        low_cut_gate = max(seg_floor * 1.20, voice_floor_threshold * 1.05 if voice_floor_threshold > 0 else 0.0, 0.008)
-        for idx in range(len(seg_smooth) - 1, back_window_start - 1, -1):
+        cut_in_seg = min(max(1, onset_idx), tail_offset)
+        low_cut_gate = max(seg_floor * 1.08, voice_floor_threshold * 1.02 if voice_floor_threshold > 0 else 0.0, 0.006)
+        back_cut = max(1, len(seg_smooth) - max(4, len(seg_smooth) // 3))
+        for idx in range(min(len(seg_smooth) - 1, cut_in_seg), max(0, cut_in_seg - 4) - 1, -1):
             if float(seg_smooth[idx]) <= low_cut_gate:
                 back_cut = idx
                 break
