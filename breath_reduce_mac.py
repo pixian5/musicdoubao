@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 56
+VERSION = 57
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -561,6 +561,80 @@ def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_t
     return trimmed
 
 
+def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, voice_floor_threshold):
+    snapped = []
+    if not segments:
+        return snapped
+
+    look_ahead_frames = max(4, int(round(0.14 / frame_time)))
+    for start, end in segments:
+        start_frame = max(0, int(start / HOP_LENGTH))
+        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
+        seg_raw = np.asarray(raw_rms[start_frame:end_frame], dtype=np.float32)
+        follow_raw = np.asarray(raw_rms[end_frame : end_frame + look_ahead_frames], dtype=np.float32)
+        if len(seg_raw) < 4 or len(follow_raw) < 3:
+            snapped.append((start, end))
+            continue
+
+        seg_smooth = _moving_average(seg_raw, 3)
+        follow_smooth = _moving_average(follow_raw, 3)
+        tail_len = max(4, len(seg_smooth) // 3)
+        tail = seg_smooth[-tail_len:]
+        combined = np.concatenate((tail, follow_smooth))
+        if len(combined) < 5:
+            snapped.append((start, end))
+            continue
+
+        valley_limit = max(
+            float(np.min(combined)) * 1.35,
+            float(np.percentile(seg_smooth, 20)) * 1.10,
+            voice_floor_threshold * 1.05 if voice_floor_threshold > 0 else 0.0,
+            0.004,
+        )
+        rise_gate = max(
+            valley_limit * 1.8,
+            float(np.percentile(seg_smooth, 70)) * 0.75,
+            0.010,
+        )
+
+        best_valley_idx = None
+        for idx in range(1, len(combined) - 2):
+            cur = float(combined[idx])
+            prev = float(combined[idx - 1])
+            nxt = float(combined[idx + 1])
+            nxt2 = float(combined[idx + 2])
+            if (
+                cur <= valley_limit
+                and cur <= prev + 1e-6
+                and cur <= nxt + 1e-6
+                and nxt >= cur * 1.20
+                and nxt2 >= nxt * 1.05
+                and max(nxt, nxt2) >= rise_gate
+            ):
+                best_valley_idx = idx
+                break
+
+        if best_valley_idx is None:
+            snapped.append((start, end))
+            continue
+
+        tail_offset = len(seg_smooth) - len(tail)
+        if best_valley_idx < len(tail):
+            cut_idx = tail_offset + best_valley_idx
+        else:
+            cut_idx = len(seg_smooth) - 1
+
+        cut_idx = max(1, min(cut_idx, len(seg_smooth) - 1))
+        new_end_frame = start_frame + cut_idx
+        new_end = int(new_end_frame * frame_time * sr)
+        if new_end - start >= int(0.04 * sr):
+            snapped.append((start, new_end))
+        else:
+            snapped.append((start, end))
+
+    return snapped
+
+
 def _detect_low_voice_silence_segments(raw_rms, frame_time, sr, voice_floor_threshold):
     if voice_floor_threshold <= 0.0:
         return []
@@ -1038,6 +1112,13 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         raw_rms,
         peak_reject_threshold,
         percentile_reject_threshold,
+        voice_floor_threshold,
+    )
+    filtered = _snap_right_edge_to_tail_valley(
+        filtered,
+        sr,
+        frame_time,
+        raw_rms,
         voice_floor_threshold,
     )
     if floor_silence_segments:
