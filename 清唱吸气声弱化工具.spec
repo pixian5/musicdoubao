@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='清唱吸气声弱化工具',
+    name='吸气声弱化工具',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,11 +40,11 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='清唱吸气声弱化工具',
+    name='吸气声弱化工具',
 )
 app = BUNDLE(
     coll,
-    name='清唱吸气声弱化工具.app',
+    name='吸气声弱化工具.app',
     icon=None,
     bundle_identifier=None,
 )

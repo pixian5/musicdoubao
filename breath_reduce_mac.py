@@ -1455,7 +1455,7 @@ def process_breath(
 class BreathReducerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"清唱吸气声弱化工具 v{VERSION}")
+        self.root.title(f"吸气声弱化工具 v{VERSION}")
         self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
         self.root.resizable(True, True)
         self.app_config = _load_app_config()
