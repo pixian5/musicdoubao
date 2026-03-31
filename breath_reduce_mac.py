@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 60
+VERSION = 61
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -566,7 +566,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, peak_reje
     if not segments:
         return snapped
 
-    look_ahead_frames = max(6, int(round(0.20 / frame_time)))
+    look_ahead_frames = max(12, int(round(0.55 / frame_time)))
     for start, end in segments:
         start_frame = max(0, int(start / HOP_LENGTH))
         end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
@@ -623,7 +623,7 @@ def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, peak_reje
             window = combined[search_start:search_end]
             best_valley_idx = search_start + int(np.argmin(window))
 
-        cut_idx = max(entry_idx, min(best_valley_idx, len(seg_raw) - 1))
+        cut_idx = max(entry_idx, best_valley_idx)
         new_end_frame = start_frame + cut_idx
         new_end = int(new_end_frame * frame_time * sr)
         if new_end - start >= int(0.04 * sr):
