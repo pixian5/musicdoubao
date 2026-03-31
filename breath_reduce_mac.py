@@ -20,6 +20,7 @@ LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
 MIN_MANUAL_DRAG_SEC = 0.03
 MIN_RESIZE_DRAG_SEC = 0.02
+PLAYHEAD_DRAW_INTERVAL_MS = 120
 APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
 
 rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
@@ -1582,6 +1583,7 @@ class BreathReducerApp:
         self._syncing_scrollbars = False
         self.source_playhead_line = None
         self.output_playhead_line = None
+        self.last_playhead_draw_ms = None
 
         self._build_controls()
         self._build_plot()
@@ -2019,6 +2021,7 @@ class BreathReducerApp:
         self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output", plot_kind="output")
         self.canvas_source.draw_idle()
         self.canvas_output.draw_idle()
+        self.last_playhead_draw_ms = None
         self.sync_scrollbars()
 
     def sync_scrollbars(self):
@@ -2067,8 +2070,16 @@ class BreathReducerApp:
         x_value = [self.selected_time_sec, self.selected_time_sec]
         self.source_playhead_line.set_xdata(x_value)
         self.output_playhead_line.set_xdata(x_value)
-        self.canvas_source.draw()
-        self.canvas_output.draw()
+        now_ms = int(self.root.winfo_toplevel().tk.call("clock", "milliseconds"))
+        should_draw = (
+            force_refresh
+            or self.last_playhead_draw_ms is None
+            or (now_ms - self.last_playhead_draw_ms) >= PLAYHEAD_DRAW_INTERVAL_MS
+        )
+        if should_draw:
+            self.canvas_source.draw_idle()
+            self.canvas_output.draw_idle()
+            self.last_playhead_draw_ms = now_ms
 
     def on_scroll(self, _which, value):
         if self._syncing_scrollbars:
