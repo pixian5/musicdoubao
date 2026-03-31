@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 52
+VERSION = 53
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1459,6 +1459,105 @@ def _apply_output_headroom(audio, target_peak=0.98):
     return (audio * gain).astype(np.float32), gain
 
 
+def _smoothstep(values):
+    values = np.asarray(values, dtype=np.float32)
+    clipped = np.clip(values, 0.0, 1.0)
+    return clipped * clipped * (3.0 - 2.0 * clipped)
+
+
+def _compute_loud_phrase_taming_gain(audio, sr):
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.size == 0:
+        return np.asarray([], dtype=np.float32), {
+            "active": False,
+            "threshold": 0.0,
+            "peak": 0.0,
+            "min_gain": 1.0,
+        }
+
+    if audio.ndim == 1:
+        control = np.abs(audio)
+    else:
+        control = np.max(np.abs(audio), axis=1)
+    if control.size == 0:
+        return np.asarray([], dtype=np.float32), {
+            "active": False,
+            "threshold": 0.0,
+            "peak": 0.0,
+            "min_gain": 1.0,
+        }
+
+    smooth_window = max(1, int(round(sr * 0.006)))
+    control_env = _moving_average(control, smooth_window)
+    control_peak = float(np.max(control_env))
+    if control_peak <= 0.0:
+        return np.ones_like(control_env, dtype=np.float32), {
+            "active": False,
+            "threshold": 0.0,
+            "peak": control_peak,
+            "min_gain": 1.0,
+        }
+
+    p90 = float(np.percentile(control_env, 90))
+    p97 = float(np.percentile(control_env, 97))
+    p995 = float(np.percentile(control_env, 99.5))
+    threshold = max(p97, p90 * 1.22, 0.18)
+    if control_peak <= threshold * 1.02:
+        return np.ones_like(control_env, dtype=np.float32), {
+            "active": False,
+            "threshold": threshold,
+            "peak": control_peak,
+            "min_gain": 1.0,
+        }
+
+    ratio = 3.8
+    knee = max(threshold * 0.45, 0.035)
+    desired = control_env.copy()
+    hard_mask = control_env > threshold
+    desired[hard_mask] = threshold + (control_env[hard_mask] - threshold) / ratio
+    hard_gain = np.ones_like(control_env, dtype=np.float32)
+    hard_gain[hard_mask] = desired[hard_mask] / np.maximum(control_env[hard_mask], 1e-6)
+
+    knee_start = threshold - knee
+    knee_end = threshold + knee
+    knee_mix = _smoothstep((control_env - knee_start) / max(knee_end - knee_start, 1e-6))
+    target_gain = 1.0 - knee_mix * (1.0 - hard_gain)
+
+    extra_hot = np.clip((control_env - p995) / max(control_peak - p995, 1e-6), 0.0, 1.0)
+    target_gain *= 1.0 - 0.12 * extra_hot
+    target_gain = np.clip(target_gain, 0.58, 1.0)
+
+    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.010))
+    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.180))
+    smoothed_gain = np.ones_like(target_gain, dtype=np.float32)
+    smoothed_gain[0] = target_gain[0]
+    for idx in range(1, len(target_gain)):
+        coeff = attack_coeff if target_gain[idx] < smoothed_gain[idx - 1] else release_coeff
+        smoothed_gain[idx] = coeff * smoothed_gain[idx - 1] + (1.0 - coeff) * target_gain[idx]
+    smoothed_gain = np.clip(smoothed_gain, 0.58, 1.0).astype(np.float32)
+    return smoothed_gain, {
+        "active": True,
+        "threshold": threshold,
+        "peak": control_peak,
+        "min_gain": float(np.min(smoothed_gain)),
+    }
+
+
+def _apply_sample_gain_curve(audio, gain_curve):
+    audio = np.asarray(audio, dtype=np.float32)
+    gain_curve = np.asarray(gain_curve, dtype=np.float32)
+    if audio.size == 0 or gain_curve.size == 0:
+        return audio.astype(np.float32)
+    usable = min(len(audio), len(gain_curve))
+    if audio.ndim == 1:
+        adjusted = audio.copy()
+        adjusted[:usable] *= gain_curve[:usable]
+        return adjusted.astype(np.float32)
+    adjusted = audio.copy()
+    adjusted[:usable] *= gain_curve[:usable, None]
+    return adjusted.astype(np.float32)
+
+
 def process_breath(
     input_path,
     atten_db=18,
@@ -1499,6 +1598,9 @@ def process_breath(
             breath_segments,
             atten_db=atten_db,
         )
+        loud_taming_gain, _ = _compute_loud_phrase_taming_gain(y_processed_playback, sr)
+        y_processed_playback = _apply_sample_gain_curve(y_processed_playback, loud_taming_gain)
+        y_processed_plot = _apply_sample_gain_curve(y_processed_plot, loud_taming_gain)
         y_processed_playback, output_headroom_gain = _apply_output_headroom(y_processed_playback)
         y_processed_plot = (y_processed_plot * output_headroom_gain).astype(np.float32)
 
@@ -2434,6 +2536,9 @@ class BreathReducerApp:
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
+        loud_taming_gain, _ = _compute_loud_phrase_taming_gain(self.output_playback_audio, self.sr)
+        self.output_playback_audio = _apply_sample_gain_curve(self.output_playback_audio, loud_taming_gain)
+        self.output_audio = _apply_sample_gain_curve(self.output_audio, loud_taming_gain)
         self.output_playback_audio, self.output_headroom_gain = _apply_output_headroom(self.output_playback_audio)
         self.output_audio = (self.output_audio * self.output_headroom_gain).astype(np.float32)
         if self.input_path:
