@@ -1202,7 +1202,7 @@ def _write_output_mp3(y_processed, sr, output_path):
     ffmpeg_bin = _find_ffmpeg_binary()
     temp_wav = tempfile.NamedTemporaryFile(prefix="breath_processed_", suffix=".wav", delete=False)
     temp_wav.close()
-    sf.write(temp_wav.name, y_processed, sr)
+    sf.write(temp_wav.name, y_processed, sr, subtype="FLOAT")
     try:
         subprocess.run(
             [
@@ -1212,8 +1212,8 @@ def _write_output_mp3(y_processed, sr, output_path):
                 temp_wav.name,
                 "-codec:a",
                 "libmp3lame",
-                "-q:a",
-                "2",
+                "-b:a",
+                "320k",
                 str(output_path),
             ],
             check=True,
