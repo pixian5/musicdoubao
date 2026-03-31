@@ -14,7 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 64
+VERSION = 65
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1304,17 +1304,15 @@ def _intersect_time_ranges(base_ranges, target_range):
 def _build_half_time_segment(segment):
     segment = np.asarray(segment, dtype=np.float32)
     if len(segment) <= 2:
-        return np.zeros_like(segment, dtype=np.float32)
+        return np.zeros(max(1, len(segment) // 2), dtype=np.float32)
     keep_len = max(1, len(segment) // 2)
     source_idx = np.linspace(0, len(segment) - 1, keep_len, dtype=np.float32)
     compressed = np.interp(source_idx, np.arange(len(segment), dtype=np.float32), segment).astype(np.float32)
-    output = np.zeros_like(segment, dtype=np.float32)
-    output[:keep_len] = compressed
     fade_len = min(max(16, keep_len // 8), keep_len)
     if fade_len > 1:
-        output[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-        output[keep_len - fade_len : keep_len] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-    return output
+        compressed[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        compressed[keep_len - fade_len : keep_len] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    return compressed
 
 
 def _build_breath_silence_envelope(segment, sr, gain):
@@ -1344,26 +1342,66 @@ def _build_breath_silence_envelope(segment, sr, gain):
     return np.clip(envelope * max(gain, 0.0), 0.0, 1.0)
 
 
-def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segments=None):
-    y_processed = y.copy()
+def _build_processed_segment(segment, sr, gain, half_time=False):
+    segment = np.asarray(segment, dtype=np.float32)
+    if half_time:
+        compressed = _build_half_time_segment(segment)
+        envelope = _build_breath_silence_envelope(compressed, sr, gain).astype(np.float32)
+        return compressed * envelope
+    envelope = _build_breath_silence_envelope(segment, sr, gain).astype(np.float32)
+    return segment * envelope
+
+
+def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments=None):
+    source_audio = np.asarray(y, dtype=np.float32)
     gain = np.power(10, -atten_db / 20)
-    half_time_segments = half_time_segments or []
-    half_time_lookup = {(int(start), int(end)) for start, end in half_time_segments}
+    half_time_lookup = {(int(start), int(end)) for start, end in (half_time_segments or [])}
+    rendered_chunks = []
+    timeline_segments = []
+    cursor = 0
+    output_cursor = 0
+
     for start, end in breath_segments:
-        start = max(0, start)
-        end = min(end, len(y_processed))
+        start = max(0, int(start))
+        end = min(int(end), len(source_audio))
         if end <= start:
             continue
-        segment = np.asarray(y_processed[start:end], dtype=np.float32)
-        envelope = _build_breath_silence_envelope(segment, sr, gain).astype(np.float32)
-        if (int(start), int(end)) in half_time_lookup:
-            half_time_segment = _build_half_time_segment(segment)
-            y_processed[start:end] = half_time_segment * envelope
-            continue
-        processed_segment = segment * envelope
-        y_processed[start:end] = processed_segment
+        if start > cursor:
+            chunk = np.asarray(source_audio[cursor:start], dtype=np.float32)
+            rendered_chunks.append(chunk)
+            next_cursor = output_cursor + len(chunk)
+            timeline_segments.append((cursor, start, output_cursor, next_cursor))
+            output_cursor = next_cursor
 
-    return y_processed
+        segment = np.asarray(source_audio[start:end], dtype=np.float32)
+        processed = _build_processed_segment(segment, sr, gain, half_time=(start, end) in half_time_lookup)
+        rendered_chunks.append(processed)
+        next_cursor = output_cursor + len(processed)
+        timeline_segments.append((start, end, output_cursor, next_cursor))
+        output_cursor = next_cursor
+        cursor = end
+
+    if cursor < len(source_audio):
+        chunk = np.asarray(source_audio[cursor:], dtype=np.float32)
+        rendered_chunks.append(chunk)
+        next_cursor = output_cursor + len(chunk)
+        timeline_segments.append((cursor, len(source_audio), output_cursor, next_cursor))
+        output_cursor = next_cursor
+
+    if not rendered_chunks:
+        return np.asarray([], dtype=np.float32), []
+    return np.concatenate(rendered_chunks).astype(np.float32), timeline_segments
+
+
+def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segments=None):
+    output_audio, _ = _render_output_audio(
+        y,
+        sr,
+        breath_segments,
+        atten_db=atten_db,
+        half_time_segments=half_time_segments,
+    )
+    return output_audio
 
 
 def process_breath(
@@ -1393,7 +1431,7 @@ def process_breath(
             left_append_ms=left_append_ms,
             right_append_ms=right_append_ms,
         )
-        y_processed = _apply_breath_segments(y, sr, breath_segments, atten_db=atten_db)
+        y_processed, output_timeline_segments = _render_output_audio(y, sr, breath_segments, atten_db=atten_db)
 
         output_path = _build_output_path(input_path)
         if output_path.exists():
@@ -1408,6 +1446,7 @@ def process_breath(
             "auto_segments": list(breath_segments),
             "diagnostics": diagnostics,
             "output_path": str(output_path),
+            "output_timeline_segments": output_timeline_segments,
         }
     except Exception as exc:
         raise RuntimeError(f"处理失败：{exc}") from exc
@@ -1425,6 +1464,7 @@ class BreathReducerApp:
         self.output_path = ""
         self.source_audio = None
         self.output_audio = None
+        self.output_timeline_segments = []
         self.sr = None
         self.segments = []
         self.auto_segments = []
@@ -1683,6 +1723,7 @@ class BreathReducerApp:
 
         self.source_audio = result["source_audio"]
         self.output_audio = result["output_audio"]
+        self.output_timeline_segments = result.get("output_timeline_segments", [])
         self.sr = result["sr"]
         self.segments = result["segments"]
         self.output_path = result["output_path"]
@@ -1741,13 +1782,70 @@ class BreathReducerApp:
         times = librosa.times_like(envelope, sr=self.sr, hop_length=HOP_LENGTH)
         return times, envelope
 
-    def _draw_wave_envelope(self, ax, audio, title, active=False):
+    def _map_source_sample_to_output_sample(self, source_sample):
+        if self.output_audio is None or self.sr is None:
+            return 0
+        source_sample = int(np.clip(source_sample, 0, len(self.source_audio) if self.source_audio is not None else source_sample))
+        if not self.output_timeline_segments:
+            return int(np.clip(source_sample, 0, len(self.output_audio)))
+        for src_start, src_end, out_start, out_end in self.output_timeline_segments:
+            if source_sample <= src_end:
+                src_len = max(1, src_end - src_start)
+                out_len = max(1, out_end - out_start)
+                ratio = np.clip((source_sample - src_start) / src_len, 0.0, 1.0)
+                return int(np.clip(round(out_start + ratio * out_len), 0, len(self.output_audio)))
+        return len(self.output_audio)
+
+    def _map_output_sample_to_source_sample(self, output_sample):
+        if self.source_audio is None or self.sr is None:
+            return 0
+        output_sample = int(np.clip(output_sample, 0, len(self.output_audio) if self.output_audio is not None else output_sample))
+        if not self.output_timeline_segments:
+            return int(np.clip(output_sample, 0, len(self.source_audio)))
+        for src_start, src_end, out_start, out_end in self.output_timeline_segments:
+            if output_sample <= out_end:
+                out_len = max(1, out_end - out_start)
+                src_len = max(1, src_end - src_start)
+                ratio = np.clip((output_sample - out_start) / out_len, 0.0, 1.0)
+                return int(np.clip(round(src_start + ratio * src_len), 0, len(self.source_audio)))
+        return len(self.source_audio)
+
+    def _map_output_positions_to_source_times(self, positions):
+        positions = np.asarray(positions, dtype=np.float32)
+        if self.sr is None:
+            return positions
+        if not self.output_timeline_segments:
+            return positions / self.sr
+        source_positions = np.empty_like(positions, dtype=np.float32)
+        last_filled = np.zeros_like(positions, dtype=bool)
+        for idx, (src_start, src_end, out_start, out_end) in enumerate(self.output_timeline_segments):
+            if idx == len(self.output_timeline_segments) - 1:
+                mask = positions >= out_start
+            else:
+                mask = (positions >= out_start) & (positions < out_end)
+            if not np.any(mask):
+                continue
+            out_len = max(1, out_end - out_start)
+            src_len = max(1, src_end - src_start)
+            ratio = np.clip((positions[mask] - out_start) / out_len, 0.0, 1.0)
+            source_positions[mask] = src_start + ratio * src_len
+            last_filled[mask] = True
+        if not np.all(last_filled):
+            source_positions[~last_filled] = positions[~last_filled]
+        return source_positions / self.sr
+
+    def _draw_wave_envelope(self, ax, audio, title, active=False, plot_kind="source"):
         ax.clear()
         if audio is None or self.sr is None:
             ax.set_title(title)
             return
-        duration = len(audio) / self.sr
         times, envelope = self._compute_envelope(audio)
+        if plot_kind == "output" and len(times):
+            positions = np.arange(len(times), dtype=np.float32) * HOP_LENGTH
+            times = self._map_output_positions_to_source_times(positions)
+            duration = len(self.source_audio) / self.sr if self.source_audio is not None else (len(audio) / self.sr)
+        else:
+            duration = len(audio) / self.sr
         ax.plot(times, envelope, color="#2d6cdf", linewidth=1.2)
         ax.fill_between(times, 0, envelope, color="#8cb7ff", alpha=0.35)
         ax.set_title(f"{title}{'  [当前选择]' if active else ''}")
@@ -1827,8 +1925,8 @@ class BreathReducerApp:
             ax.set_xlim(self.current_view_start, self.current_view_start + view_duration)
 
     def refresh_plots(self):
-        self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source")
-        self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output")
+        self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source", plot_kind="source")
+        self._draw_wave_envelope(self.ax_output, self.output_audio, "输出文件音量谱", active=self.active_plot == "output", plot_kind="output")
         self.canvas_source.draw_idle()
         self.canvas_output.draw_idle()
         self.sync_scrollbars()
@@ -2219,7 +2317,7 @@ class BreathReducerApp:
             return
         self._stop_player()
         half_time_segments = _time_ranges_to_samples(self.half_time_ranges, self.sr, len(self.source_audio))
-        self.output_audio = _apply_breath_segments(
+        self.output_audio, self.output_timeline_segments = _render_output_audio(
             self.source_audio,
             self.sr,
             self.segments,
@@ -2558,7 +2656,11 @@ class BreathReducerApp:
         if self.player_process is None or self.player_process.poll() is not None:
             end_time = self.selected_time_sec
             if self.playback_duration is not None:
-                end_time = self.playback_start_audio_time + self.playback_duration
+                end_audio_time = self.playback_start_audio_time + self.playback_duration
+                if self.playback_plot_kind == "output":
+                    end_time = self._map_output_sample_to_source_sample(int(round(end_audio_time * self.sr))) / self.sr
+                else:
+                    end_time = end_audio_time
             if end_time is not None:
                 self.selected_time_sec = end_time
                 self._update_playhead_display(follow_playback=True)
@@ -2568,12 +2670,20 @@ class BreathReducerApp:
         now_ms = int(self.root.winfo_toplevel().tk.call("clock", "milliseconds"))
         elapsed = max(0.0, (now_ms - self.playback_start_wall_time) / 1000.0)
         if self.playback_duration is not None and elapsed > self.playback_duration:
-            self.selected_time_sec = self.playback_start_audio_time + self.playback_duration
+            end_audio_time = self.playback_start_audio_time + self.playback_duration
+            if self.playback_plot_kind == "output":
+                self.selected_time_sec = self._map_output_sample_to_source_sample(int(round(end_audio_time * self.sr))) / self.sr
+            else:
+                self.selected_time_sec = end_audio_time
             self._update_playhead_display(follow_playback=True)
             self._finish_active_playback()
             return
 
-        self.selected_time_sec = self.playback_start_audio_time + elapsed
+        current_audio_time = self.playback_start_audio_time + elapsed
+        if self.playback_plot_kind == "output":
+            self.selected_time_sec = self._map_output_sample_to_source_sample(int(round(current_audio_time * self.sr))) / self.sr
+        else:
+            self.selected_time_sec = current_audio_time
         self._update_playhead_display(follow_playback=True)
         self.playback_job = self.root.after(80, self._schedule_playback_tick)
 
@@ -2593,6 +2703,8 @@ class BreathReducerApp:
             return
 
         start_sample = int(max(0, self.selected_time_sec) * self.sr)
+        if processed:
+            start_sample = self._map_source_sample_to_output_sample(start_sample)
         if start_sample >= len(audio):
             return
 
@@ -2608,7 +2720,7 @@ class BreathReducerApp:
         self.playback_temp_path = temp_audio.name
         self.player_process = subprocess.Popen(["afplay", temp_audio.name])
         self._start_playback_tracking(
-            self.selected_time_sec,
+            start_sample / self.sr,
             len(clip) / self.sr,
             "output" if processed else "source",
         )
@@ -2619,6 +2731,9 @@ class BreathReducerApp:
         if audio is None or self.sr is None:
             return
         start_sample = int(max(0, resume_from) * self.sr)
+        if self.playback_plot_kind == "output":
+            start_sample = self._map_source_sample_to_output_sample(start_sample)
+            resume_from = start_sample / self.sr
         clip = audio[start_sample:]
         if len(clip) == 0:
             return
@@ -2680,7 +2795,12 @@ class BreathReducerApp:
             return
 
         start, end = self.segments[self.selected_segment_index]
-        clip = audio[start:end]
+        if processed:
+            clip_start = self._map_source_sample_to_output_sample(start)
+            clip_end = self._map_source_sample_to_output_sample(end)
+        else:
+            clip_start, clip_end = start, end
+        clip = audio[clip_start:clip_end]
         if len(clip) == 0:
             return
 
