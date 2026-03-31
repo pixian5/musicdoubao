@@ -14,11 +14,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 61
+VERSION = 62
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
 MIN_MANUAL_DRAG_SEC = 0.03
+MIN_RESIZE_DRAG_SEC = 0.02
 APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
 
 rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
@@ -1456,6 +1457,9 @@ class BreathReducerApp:
         self.resize_segment_index = None
         self.resize_edge = None
         self.resize_preview_time = None
+        self.pending_resize_index = None
+        self.pending_resize_edge = None
+        self.pending_resize_press_time = None
         self.current_view_start = 0.0
         self.current_view_duration = 8.0
         self._syncing_scrollbars = False
@@ -1920,17 +1924,16 @@ class BreathReducerApp:
         if event.xdata is None or self.sr is None:
             return
 
+        self.pending_resize_index = None
+        self.pending_resize_edge = None
+        self.pending_resize_press_time = None
         resize_hit = self._find_resize_handle(float(event.xdata))
         if resize_hit is not None and not self.selection_mode and self.range_edit_mode is None and not self.pick_detected_segment_mode:
             self.active_plot = plot_kind
-            self.resize_segment_index, self.resize_edge = resize_hit
-            self.selected_segment_index = self.resize_segment_index
+            self.pending_resize_index, self.pending_resize_edge = resize_hit
+            self.pending_resize_press_time = float(event.xdata)
+            self.selected_segment_index = self.pending_resize_index
             self.selected_time_sec = float(event.xdata)
-            self.resize_preview_time = float(event.xdata)
-            self.status_label.config(
-                text=f"状态：拖动调整绿色片段{'左侧' if self.resize_edge == 'start' else '右侧'}边界",
-                foreground="purple",
-            )
             self.refresh_plots()
             return
 
@@ -1963,6 +1966,24 @@ class BreathReducerApp:
     def on_plot_motion(self, event, plot_kind):
         if event.xdata is None or self.sr is None:
             return
+        if self.pending_resize_index is not None and self.pending_resize_press_time is not None:
+            moved_sec = abs(float(event.xdata) - self.pending_resize_press_time)
+            if moved_sec >= MIN_RESIZE_DRAG_SEC:
+                self.active_plot = plot_kind
+                self.resize_segment_index = self.pending_resize_index
+                self.resize_edge = self.pending_resize_edge
+                self.resize_preview_time = float(event.xdata)
+                self.selected_segment_index = self.resize_segment_index
+                self.selected_time_sec = float(event.xdata)
+                self.pending_resize_index = None
+                self.pending_resize_edge = None
+                self.pending_resize_press_time = None
+                self.status_label.config(
+                    text=f"状态：拖动调整绿色片段{'左侧' if self.resize_edge == 'start' else '右侧'}边界",
+                    foreground="purple",
+                )
+                self._update_playhead_display(force_refresh=True)
+                return
         if self.resize_segment_index is not None:
             self.active_plot = plot_kind
             self.resize_preview_time = float(event.xdata)
@@ -1970,6 +1991,10 @@ class BreathReducerApp:
             self._update_playhead_display(force_refresh=True)
 
     def on_plot_release(self, event, plot_kind):
+        pending_resize_index = self.pending_resize_index
+        self.pending_resize_index = None
+        self.pending_resize_edge = None
+        self.pending_resize_press_time = None
         if self.resize_segment_index is not None and self.sr is not None:
             new_time_sec = self.resize_preview_time
             if event.xdata is not None:
@@ -1979,6 +2004,9 @@ class BreathReducerApp:
             self.resize_segment_index = None
             self.resize_edge = None
             self.resize_preview_time = None
+            return
+        if pending_resize_index is not None and event.xdata is not None:
+            self.on_plot_click(event, plot_kind)
             return
         if ((self.range_edit_mode != "add" and not self.selection_mode) or self.drag_start_sec is None or self.sr is None):
             return
