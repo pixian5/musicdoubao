@@ -1410,7 +1410,31 @@ def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segmen
 
 
 def _load_audio_for_processing(input_path):
-    y_full, sr = librosa.load(input_path, sr=None, mono=False)
+    ffmpeg_bin = _find_ffmpeg_binary()
+    temp_wav = tempfile.NamedTemporaryFile(prefix="breath_input_decode_", suffix=".wav", delete=False)
+    temp_wav.close()
+    try:
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                input_path,
+                "-vn",
+                "-map",
+                "a:0",
+                "-acodec",
+                "pcm_f32le",
+                temp_wav.name,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        y_full, sr = sf.read(temp_wav.name, dtype="float32", always_2d=False)
+    finally:
+        if os.path.exists(temp_wav.name):
+            os.remove(temp_wav.name)
     y_full = np.asarray(y_full, dtype=np.float32)
     if y_full.ndim == 1:
         playback_audio = y_full
