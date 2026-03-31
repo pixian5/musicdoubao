@@ -3152,11 +3152,9 @@ class BreathReducerApp:
         if (
             total_duration is not None
             and self.selected_time_sec is not None
-            and self.last_playback_anchor_sec is not None
-            and self.last_playback_target == target
             and self.selected_time_sec >= total_duration - 0.05
         ):
-            self.selected_time_sec = min(max(self.last_playback_anchor_sec, 0.0), total_duration)
+            self.selected_time_sec = 0.0
             self._update_playhead_display(follow_playback=True, force_refresh=True)
         self.play_active_selection(processed)
         self.status_label.config(text=f"状态：开始从当前选中位置播放{('输出文件' if processed else '原文件')}", foreground="blue")
