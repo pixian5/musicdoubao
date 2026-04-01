@@ -15,6 +15,10 @@ INVALID_FILENAME_CHARS = re.compile(r'[/:*?"<>|\\]')
 SPACE_RUN = re.compile(r"\s+")
 
 
+def is_m4a_name(name: str) -> bool:
+    return name.lower().endswith(".m4a")
+
+
 def sanitize_title(title: str) -> str:
     cleaned = INVALID_FILENAME_CHARS.sub(" ", title.strip())
     cleaned = SPACE_RUN.sub(" ", cleaned).strip().rstrip(".")
@@ -75,6 +79,8 @@ def save_state(state_path: Path, state: dict) -> None:
 
 
 def build_target_name(title: str, source_name: str) -> str:
+    if not is_m4a_name(source_name):
+        raise ValueError(f"只支持同步 .m4a 文件：{source_name}")
     return f"{sanitize_title(title)}+{source_name}"
 
 
@@ -83,6 +89,8 @@ def build_legacy_name_map(recordings: list[dict]) -> dict[str, str]:
     reserved = set()
     reserved_fold = set()
     for item in recordings:
+        if not is_m4a_name(item["source_name"]):
+            continue
         base = sanitize_title(item["title"])
         candidate = f"{base}.m4a"
         idx = 2
@@ -103,6 +111,8 @@ def find_compat_existing_file(target_dir: Path, title: str, source_name: str, us
     source_stem = Path(source_name).stem
     date_hint = source_stem.split()[0] if source_stem else ""
     for candidate in target_dir.glob("*.m4a"):
+        if not candidate.is_file() or not is_m4a_name(candidate.name):
+            continue
         if candidate.name in used_names:
             continue
         if not candidate.stem.startswith(expected_prefix):
@@ -121,7 +131,13 @@ def find_compat_existing_file(target_dir: Path, title: str, source_name: str, us
 def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path: Path) -> dict:
     target_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(state_path)
-    state_items = state.setdefault("items", {})
+    raw_state_items = state.setdefault("items", {})
+    state_items = {
+        source_name: item
+        for source_name, item in raw_state_items.items()
+        if is_m4a_name(source_name) and is_m4a_name(str(item.get("target_name", "")))
+    }
+    state["items"] = state_items
     recordings = load_recordings(db_path)
     legacy_name_map = build_legacy_name_map(recordings)
     claimed_existing_names = set()
@@ -133,6 +149,8 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
 
     for item in recordings:
         source_name = item["source_name"]
+        if not is_m4a_name(source_name):
+            continue
         title = item["title"]
         source_path = recordings_dir / source_name
         if not source_path.exists():
@@ -143,7 +161,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         target_path = target_dir / target_name
         prev = state_items.get(source_name, {})
         prev_name = prev.get("target_name")
-        prev_path = target_dir / prev_name if prev_name else None
+        prev_path = target_dir / prev_name if prev_name and is_m4a_name(str(prev_name)) else None
         source_size = source_path.stat().st_size
 
         if prev_name and prev_name != target_name and prev_path and prev_path.exists():
