@@ -11,6 +11,7 @@ DEFAULT_RECORDINGS_DIR = Path.home() / "Library/Group Containers/group.com.apple
 DEFAULT_DB_PATH = DEFAULT_RECORDINGS_DIR / "CloudRecordings.db"
 DEFAULT_TARGET_DIR = Path("/Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹果/录音机")
 DEFAULT_STATE_NAME = ".voice_memos_sync_state.json"
+DEFAULT_TRASH_DIR_NAME = "回收站"
 INVALID_FILENAME_CHARS = re.compile(r'[/:*?"<>|\\]')
 SPACE_RUN = re.compile(r"\s+")
 
@@ -32,6 +33,7 @@ def load_recordings(db_path: Path) -> list[dict]:
             """
             SELECT
                 ZPATH,
+                ZUNIQUEID,
                 COALESCE(NULLIF(ZENCRYPTEDTITLE, ''), NULLIF(ZCUSTOMLABELFORSORTING, ''), NULLIF(ZCUSTOMLABEL, '')) AS TITLE,
                 ZDATE,
                 ZDURATION
@@ -45,10 +47,11 @@ def load_recordings(db_path: Path) -> list[dict]:
         conn.close()
 
     items = []
-    for rel_path, title, zdate, duration in rows:
+    for rel_path, unique_id, title, zdate, duration in rows:
         items.append(
             {
                 "source_name": rel_path,
+                "unique_id": (unique_id or "").strip(),
                 "title": (title or Path(rel_path).stem).strip(),
                 "zdate": zdate,
                 "duration": duration,
@@ -82,6 +85,11 @@ def build_target_name(title: str, source_name: str) -> str:
     if not is_m4a_name(source_name):
         raise ValueError(f"只支持同步 .m4a 文件：{source_name}")
     return f"{sanitize_title(title)}+{source_name}"
+
+
+def build_record_key(unique_id: str, source_name: str) -> str:
+    unique_id = (unique_id or "").strip()
+    return unique_id or source_name
 
 
 def build_legacy_name_map(recordings: list[dict]) -> dict[str, str]:
@@ -128,29 +136,80 @@ def find_compat_existing_file(target_dir: Path, title: str, source_name: str, us
     return None
 
 
+def normalize_state_items(raw_state_items: dict) -> dict[str, dict]:
+    normalized = {}
+    for source_name, item in raw_state_items.items():
+        if not isinstance(item, dict):
+            continue
+        effective_source_name = str(item.get("source_name") or source_name)
+        target_name = str(item.get("target_name") or "")
+        if not is_m4a_name(effective_source_name) or not is_m4a_name(target_name):
+            continue
+        unique_id = str(item.get("unique_id") or "").strip()
+        record_key = build_record_key(unique_id, effective_source_name)
+        normalized[record_key] = {
+            **item,
+            "source_name": effective_source_name,
+            "target_name": target_name,
+            "unique_id": unique_id,
+        }
+    return normalized
+
+
+def build_source_name_index(state_items: dict[str, dict]) -> dict[str, str]:
+    index = {}
+    for record_key, item in state_items.items():
+        source_name = str(item.get("source_name") or "")
+        if source_name and source_name not in index:
+            index[source_name] = record_key
+    return index
+
+
+def move_to_trash(file_path: Path, trash_dir: Path) -> Path | None:
+    if not file_path.exists():
+        return None
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    destination = trash_dir / file_path.name
+    if destination.exists():
+        stem = file_path.stem
+        suffix = file_path.suffix
+        idx = 2
+        while True:
+            candidate = trash_dir / f"{stem} ({idx}){suffix}"
+            if not candidate.exists():
+                destination = candidate
+                break
+            idx += 1
+    file_path.rename(destination)
+    return destination
+
+
 def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path: Path) -> dict:
     target_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(state_path)
     raw_state_items = state.setdefault("items", {})
-    state_items = {
-        source_name: item
-        for source_name, item in raw_state_items.items()
-        if is_m4a_name(source_name) and is_m4a_name(str(item.get("target_name", "")))
-    }
+    state_items = normalize_state_items(raw_state_items)
     state["items"] = state_items
     recordings = load_recordings(db_path)
     legacy_name_map = build_legacy_name_map(recordings)
+    trash_dir = target_dir / DEFAULT_TRASH_DIR_NAME
     claimed_existing_names = set()
+    source_name_index = build_source_name_index(state_items)
+    next_state_items = {}
+    seen_record_keys = set()
 
     copied = 0
     renamed = 0
     skipped = 0
+    trashed = 0
     missing_sources = []
 
     for item in recordings:
         source_name = item["source_name"]
         if not is_m4a_name(source_name):
             continue
+        unique_id = item["unique_id"]
+        record_key = build_record_key(unique_id, source_name)
         title = item["title"]
         source_path = recordings_dir / source_name
         if not source_path.exists():
@@ -159,7 +218,18 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
 
         target_name = build_target_name(title, source_name)
         target_path = target_dir / target_name
-        prev = state_items.get(source_name, {})
+        prev = state_items.get(record_key)
+        if prev is None:
+            fallback_key = source_name_index.get(source_name)
+            if fallback_key:
+                prev = state_items.get(fallback_key)
+        if prev is None and unique_id:
+            for existing_key, existing_item in state_items.items():
+                if str(existing_item.get("unique_id") or "").strip() == unique_id:
+                    prev = existing_item
+                    break
+        if prev is None:
+            prev = {}
         prev_name = prev.get("target_name")
         prev_path = target_dir / prev_name if prev_name and is_m4a_name(str(prev_name)) else None
         source_size = source_path.stat().st_size
@@ -204,16 +274,29 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
                 copied += 1
             else:
                 skipped += 1
-        claimed_existing_names.add(target_name)
+                claimed_existing_names.add(target_name)
 
-        state_items[source_name] = {
+        next_state_items[record_key] = {
             "title": title,
             "target_name": target_name,
             "source_name": source_name,
+            "unique_id": unique_id,
             "zdate": item["zdate"],
             "duration": item["duration"],
         }
+        seen_record_keys.add(record_key)
 
+    for record_key, item in state_items.items():
+        if record_key in seen_record_keys:
+            continue
+        target_name = str(item.get("target_name") or "")
+        if not is_m4a_name(target_name):
+            continue
+        target_path = target_dir / target_name
+        if move_to_trash(target_path, trash_dir) is not None:
+            trashed += 1
+
+    state["items"] = next_state_items
     state["last_run_epoch"] = int(time.time())
     save_state(state_path, state)
     return {
@@ -221,9 +304,11 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         "copied": copied,
         "renamed": renamed,
         "skipped": skipped,
+        "trashed": trashed,
         "missing_sources": missing_sources,
         "state_path": str(state_path),
         "target_dir": str(target_dir),
+        "trash_dir": str(trash_dir),
     }
 
 
