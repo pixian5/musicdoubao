@@ -2491,6 +2491,12 @@ class BreathReducerApp:
         # ── 减半模式的 press 已消费本次点击：release 直接跳过所有逻辑 ──
         if self._half_time_consumed:
             self._half_time_consumed = False
+            # 在完整点击周期（press+release）结束时再提交一次重绘，避免需额外交互才可见
+            self.refresh_plots()
+            try:
+                self.root.update_idletasks()
+            except tk.TclError:
+                _event_log("HALF-TIME release refresh skipped: Tk widget already destroyed")
             return
 
         # ── active resize 提交 ──
