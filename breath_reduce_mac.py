@@ -2611,6 +2611,7 @@ class BreathReducerApp:
             # 这条路径理论上不会被触发（press 已处理），保留作安全冗余
             # 行为与 _apply_half_time_at_time 完全一致：命中或未命中都退出
             self._apply_half_time_at_time(clicked_time, plot_kind)
+            self.refresh_plots()  # 确保颜色更新
             return
 
         if best_index is None:
