@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 54
+VERSION = 57
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -23,6 +23,23 @@ MIN_MANUAL_DRAG_SEC = 0.03
 MIN_RESIZE_DRAG_SEC = 0.02
 PLAYHEAD_DRAW_INTERVAL_MS = 120
 APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
+
+# ── 事件日志开关：设为 True 后每次鼠标事件都写到 ~/breath_event_log.txt ──
+EVENT_LOG_ENABLED = False
+_EVENT_LOG_PATH = Path.home() / "breath_event_log.txt"
+
+
+def _event_log(msg: str) -> None:
+    """仅在 EVENT_LOG_ENABLED=True 时写日志，不影响性能。"""
+    if not EVENT_LOG_ENABLED:
+        return
+    import datetime
+    line = f"[{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}\n"
+    try:
+        with _EVENT_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
 
 rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
 rcParams["axes.unicode_minus"] = False
@@ -657,6 +674,22 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
     bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
     raw_rms = np.asarray(rms, dtype=np.float32)
 
+    if raw_rms.size == 0:
+        diagnostics = {
+            "candidate_hits": 0,
+            "strict_hits": 0,
+            "relaxed_hits": 0,
+            "raw_segments": 0,
+            "kept_segments": 0,
+            "max_score": 0.0,
+            "mean_score": 0.0,
+            "avg_duration": 0.0,
+            "avg_rise_ratio": 0.0,
+            "smooth_frames": 0,
+            "strict_threshold": 0.0,
+        }
+        return [], diagnostics
+
     rms_norm = _percentile_norm(rms)
     flatness_norm = _percentile_norm(flatness)
     zcr_norm = _percentile_norm(zcr)
@@ -671,7 +704,10 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
     energy_floor = np.clip(0.004 + (1 / max(sensitivity, 1)) * 0.01, 0.003, 0.02)
     noise_floor = np.clip(0.30 - sensitivity * 0.017, 0.08, 0.28)
 
-    lead_rms = np.pad(rms_norm[4:], (0, 4), mode="edge")
+    if len(rms_norm) > 4:
+        lead_rms = np.pad(rms_norm[4:], (0, 4), mode="edge")
+    else:
+        lead_rms = np.full_like(rms_norm, rms_norm[-1])
     breath_score = (
         0.30 * flatness_norm
         + 0.22 * zcr_norm
@@ -1449,8 +1485,8 @@ def _load_audio_for_processing(input_path):
         playback_audio = y_full
         analysis_audio = y_full.copy()
     else:
-        playback_audio = np.asarray(y_full.T, dtype=np.float32)
-        analysis_audio = np.asarray(librosa.to_mono(y_full), dtype=np.float32)
+        playback_audio = np.asarray(y_full, dtype=np.float32)
+        analysis_audio = np.asarray(librosa.to_mono(y_full.T), dtype=np.float32)
     return analysis_audio, playback_audio, sr
 
 
@@ -1759,6 +1795,8 @@ class BreathReducerApp:
         self.pending_resize_index = None
         self.pending_resize_edge = None
         self.pending_resize_press_time = None
+        # press 阶段消费了 half_time 操作时置 True，release 检查后清零，防止 release 继续走普通逻辑
+        self._half_time_consumed = False
         self.current_view_start = 0.0
         self.current_view_duration = 8.0
         self._syncing_scrollbars = False
@@ -2324,15 +2362,46 @@ class BreathReducerApp:
         self.current_view_duration = min(8.0, total_duration) if total_duration else 8.0
         self.refresh_plots()
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  鼠标事件三件套：press / motion / release
+    #
+    #  核心设计原则：
+    #    • half_time_mode 在 press 时原子完成（命中即生效+退出模式），
+    #      motion 和 release 都直接 return，绝不进入其他任何路径。
+    #    • resize 的 pending→active 提升只在 motion 里发生，
+    #      release 里仅处理已激活的 resize，不再有 fallback 到 click 的歧义。
+    # ──────────────────────────────────────────────────────────────────────
+
     def on_plot_press(self, event, plot_kind):
-        if event.xdata is None or self.sr is None:
+        if self.sr is None:
             return
 
+        _event_log(f"PRESS  plot={plot_kind} x={event.xdata} half={self.half_time_mode} resize_pending={self.pending_resize_index} resize_active={self.resize_segment_index}")
+
+        # ── 减半模式：press 进入时立即关闭模式，然后原子处理本次点击 ──
+        if self.half_time_mode:
+            self.half_time_mode = False          # 立即关闭，无论后续命中与否都不再接受新点击
+            self._half_time_consumed = True      # 告知 motion/release 本次周期已被减半消费
+            self._update_selection_buttons()
+            if event.xdata is not None:
+                self._apply_half_time_at_time(float(event.xdata), plot_kind)
+            else:
+                self.status_label.config(text="状态：已退出减半模式", foreground="blue")
+            self.refresh_plots()                 # 无论命中与否，强制立即重绘，确保颜色更新
+            return
+
+        if event.xdata is None:
+            return
+
+        # ── resize handle 检测（pending 阶段：等待 motion 确认拖动意图）──
         self.pending_resize_index = None
         self.pending_resize_edge = None
         self.pending_resize_press_time = None
         resize_hit = self._find_resize_handle(float(event.xdata))
-        if resize_hit is not None and not self.selection_mode and self.range_edit_mode is None and not self.pick_detected_segment_mode:
+        if (resize_hit is not None
+                and not self.selection_mode
+                and self.range_edit_mode is None
+                and not self.pick_detected_segment_mode):
             self.active_plot = plot_kind
             self.pending_resize_index, self.pending_resize_edge = resize_hit
             self.pending_resize_press_time = float(event.xdata)
@@ -2341,6 +2410,7 @@ class BreathReducerApp:
             self.refresh_plots()
             return
 
+        # ── 手动区间添加模式 ──
         if self.range_edit_mode == "add":
             self.active_plot = plot_kind
             self.drag_start_sec = float(event.xdata)
@@ -2353,6 +2423,7 @@ class BreathReducerApp:
             self.refresh_plots()
             return
 
+        # ── 区间选择模式 ──
         if self.selection_mode:
             self.active_plot = plot_kind
             self.drag_start_sec = float(event.xdata)
@@ -2370,6 +2441,14 @@ class BreathReducerApp:
     def on_plot_motion(self, event, plot_kind):
         if event.xdata is None or self.sr is None:
             return
+
+        # ── 减半模式（或本次 press 已被减半消费）：motion 期间完全忽略 ──
+        if self.half_time_mode or self._half_time_consumed:
+            return
+
+        _event_log(f"MOTION plot={plot_kind} x={event.xdata:.3f} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
+
+        # ── pending → active resize 提升 ──
         if self.pending_resize_index is not None and self.pending_resize_press_time is not None:
             moved_sec = abs(float(event.xdata) - self.pending_resize_press_time)
             if moved_sec >= MIN_RESIZE_DRAG_SEC:
@@ -2387,7 +2466,9 @@ class BreathReducerApp:
                     foreground="purple",
                 )
                 self._update_playhead_display(force_refresh=True)
-                return
+            return
+
+        # ── active resize 跟随 ──
         if self.resize_segment_index is not None:
             self.active_plot = plot_kind
             self.resize_preview_time = float(event.xdata)
@@ -2395,24 +2476,40 @@ class BreathReducerApp:
             self._update_playhead_display(force_refresh=True)
 
     def on_plot_release(self, event, plot_kind):
-        pending_resize_index = self.pending_resize_index
-        self.pending_resize_index = None
-        self.pending_resize_edge = None
-        self.pending_resize_press_time = None
-        if self.resize_segment_index is not None and self.sr is not None:
-            new_time_sec = self.resize_preview_time
-            if event.xdata is not None:
-                new_time_sec = float(event.xdata)
+        if self.sr is None:
+            return
+
+        _event_log(f"RELEASE plot={plot_kind} x={event.xdata} half={self.half_time_mode} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
+
+        # ── 减半模式的 press 已消费本次点击：release 直接跳过所有逻辑 ──
+        if self._half_time_consumed:
+            self._half_time_consumed = False
+            return
+
+        # ── active resize 提交 ──
+        if self.resize_segment_index is not None:
+            new_time_sec = float(event.xdata) if event.xdata is not None else self.resize_preview_time
             if new_time_sec is not None:
                 self._apply_segment_resize(self.resize_segment_index, self.resize_edge, new_time_sec)
             self.resize_segment_index = None
             self.resize_edge = None
             self.resize_preview_time = None
+            self.pending_resize_index = None
+            self.pending_resize_edge = None
+            self.pending_resize_press_time = None
             return
+
+        # ── pending resize 未达到拖动阈值 → 退化为普通点击 ──
+        pending_resize_index = self.pending_resize_index
+        self.pending_resize_index = None
+        self.pending_resize_edge = None
+        self.pending_resize_press_time = None
         if pending_resize_index is not None and event.xdata is not None:
             self.on_plot_click(event, plot_kind)
             return
-        if ((self.range_edit_mode != "add" and not self.selection_mode) or self.drag_start_sec is None or self.sr is None):
+
+        # ── drag 拖拽区间结束 ──
+        if (self.range_edit_mode != "add" and not self.selection_mode) or self.drag_start_sec is None:
             return
         if event.xdata is None:
             self.drag_start_sec = None
@@ -2423,20 +2520,23 @@ class BreathReducerApp:
         start_sec = min(self.drag_start_sec, float(event.xdata))
         end_sec = max(self.drag_start_sec, float(event.xdata))
         drag_duration = abs(end_sec - start_sec)
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+
         if self.range_edit_mode == "add" and drag_duration < MIN_MANUAL_DRAG_SEC:
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
             self.range_edit_mode = None
             self.status_label.config(text="状态：已取消本次手动选择", foreground="blue")
             self._update_selection_buttons()
             self.refresh_plots()
             return
+
         if drag_duration < 0.005:
-            end_sec = min(start_sec + 0.005, len(self.source_audio) / self.sr if self.source_audio is not None else start_sec + 0.005)
+            end_sec = min(
+                start_sec + 0.005,
+                len(self.source_audio) / self.sr if self.source_audio is not None else start_sec + 0.005,
+            )
 
         self.selected_time_sec = start_sec
-        self.drag_start_sec = None
-        self.drag_plot_kind = None
         if self.range_edit_mode == "add":
             self._apply_range_edit(start_sec, end_sec)
             return
@@ -2459,6 +2559,7 @@ class BreathReducerApp:
         self.selected_time_sec = clicked_time
         best_index = None
         best_distance = float("inf")
+        near_tolerance = min(1.20, max(0.12, self.current_view_duration * 0.035))
         for index, (start, end) in enumerate(self.segments):
             start_sec = start / self.sr
             end_sec = end / self.sr
@@ -2466,7 +2567,7 @@ class BreathReducerApp:
                 best_index = index
                 break
             distance = min(abs(clicked_time - start_sec), abs(clicked_time - end_sec))
-            if distance < best_distance and distance <= 0.20:
+            if distance < best_distance and distance <= near_tolerance:
                 best_index = index
                 best_distance = distance
 
@@ -2507,32 +2608,9 @@ class BreathReducerApp:
             return
 
         if self.half_time_mode:
-            if best_index is None:
-                self.status_label.config(text="状态：未点中绿色处理片段，请再试一次", foreground="purple")
-                return
-            start, end = self.segments[best_index]
-            start_sec = start / self.sr
-            end_sec = end / self.sr
-            target = (start_sec, end_sec)
-            if self._segment_is_half_time(start_sec, end_sec):
-                self.half_time_ranges = [
-                    item for item in self.half_time_ranges
-                    if not (abs(item[0] - start_sec) <= 0.002 and abs(item[1] - end_sec) <= 0.002)
-                ]
-                action_text = "已取消"
-            else:
-                self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [target], min_gap_sec=0.0)
-                action_text = "已设为"
-            self.selected_segment_index = best_index
-            self._normalize_half_time_ranges()
-            self._rewrite_output_from_current_segments()
-            self.half_time_mode = False
-            self._update_selection_buttons()
-            self.status_label.config(
-                text=f"状态：{action_text}紫色时间减半区间 {int(round(start_sec * 1000))}-{int(round(end_sec * 1000))}",
-                foreground="purple",
-            )
-            self.refresh_plots()
+            # 这条路径理论上不会被触发（press 已处理），保留作安全冗余
+            # 行为与 _apply_half_time_at_time 完全一致：命中或未命中都退出
+            self._apply_half_time_at_time(clicked_time, plot_kind)
             return
 
         if best_index is None:
@@ -2575,7 +2653,7 @@ class BreathReducerApp:
             self.pick_segment_btn.config(text="选中处理片段")
 
         if self.half_time_mode:
-            self.half_time_btn.config(text="等待点区间")
+            self.half_time_btn.config(text="单次减半中")
         else:
             self.half_time_btn.config(text="区间时间减半")
 
@@ -2588,6 +2666,83 @@ class BreathReducerApp:
         else:
             self.select_range_btn.config(text="手动选择区间")
             self.cancel_range_btn.config(text="取消选择")
+
+    def _clear_interaction_state(self):
+        self.drag_start_sec = None
+        self.drag_plot_kind = None
+        self.pending_resize_index = None
+        self.pending_resize_edge = None
+        self.pending_resize_press_time = None
+        self.resize_segment_index = None
+        self.resize_edge = None
+        self.resize_preview_time = None
+        self._half_time_consumed = False
+
+    def _apply_half_time_at_time(self, clicked_time, plot_kind):
+        """减半模式下的点击处理。状态变更后由调用方负责 refresh_plots。"""
+        if self.sr is None or not self.segments:
+            return False
+
+        clicked_time = float(clicked_time)
+        best_index = None
+        best_distance = float("inf")
+        near_tolerance = min(0.40, max(0.12, self.current_view_duration * 0.03))
+
+        # 第一优先：点在区间内部
+        for index, (start, end) in enumerate(self.segments):
+            start_sec = start / self.sr
+            end_sec = end / self.sr
+            if start_sec <= clicked_time <= end_sec:
+                best_index = index
+                break
+            distance = min(abs(clicked_time - start_sec), abs(clicked_time - end_sec))
+            if distance < best_distance and distance <= near_tolerance:
+                best_index = index
+                best_distance = distance
+
+        # 第二优先：中心点近邻
+        if best_index is None:
+            closest_index = None
+            closest_distance = float("inf")
+            for index, (start, end) in enumerate(self.segments):
+                start_sec = start / self.sr
+                end_sec = end / self.sr
+                center_sec = (start_sec + end_sec) * 0.5
+                distance = abs(clicked_time - center_sec)
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_index = index
+            if closest_index is not None and closest_distance <= near_tolerance:
+                best_index = closest_index
+
+        if best_index is None:
+            self.status_label.config(text="状态：未点中绿色处理片段，已退出减半模式", foreground="blue")
+            return False
+
+        self.active_plot = plot_kind
+        self.selected_time_sec = clicked_time
+        start, end = self.segments[best_index]
+        start_sec = start / self.sr
+        end_sec = end / self.sr
+
+        if self._segment_is_half_time(start_sec, end_sec):
+            self.half_time_ranges = [
+                item for item in self.half_time_ranges
+                if not (abs(item[0] - start_sec) <= 0.002 and abs(item[1] - end_sec) <= 0.002)
+            ]
+            action_text = "已取消"
+        else:
+            self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
+            action_text = "已设为"
+
+        self.selected_segment_index = best_index
+        self._normalize_half_time_ranges()
+        self._rewrite_output_from_current_segments()
+        self.status_label.config(
+            text=f"状态：{action_text}紫色时间减半区间 {int(round(start_sec * 1000))}-{int(round(end_sec * 1000))}，已退出减半模式",
+            foreground="purple",
+        )
+        return True
 
     def _save_current_config(self):
         self.app_config = {
@@ -2711,11 +2866,12 @@ class BreathReducerApp:
         if self.sr is None or not self.segments:
             return
         self.half_time_mode = not self.half_time_mode
+        self._clear_interaction_state()
         if self.half_time_mode:
             self.selection_mode = False
             self.pick_detected_segment_mode = False
             self.range_edit_mode = None
-            self.status_label.config(text="状态：等待点一个绿色区间，点中后该区间会变紫并在输出里时间减半", foreground="purple")
+            self.status_label.config(text="状态：单次减半已开启，点击一个绿色区间即可变紫并自动退出", foreground="purple")
         else:
             self.status_label.config(text="状态：已退出区间时间减半模式", foreground="blue")
         self._update_selection_buttons()
@@ -2728,16 +2884,14 @@ class BreathReducerApp:
             self.half_time_mode = False
             self.range_edit_mode = None
             self.picked_detected_segments = []
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
+            self._clear_interaction_state()
             self.status_label.config(
                 text="状态：区间选择模式已开启，拖拽鼠标可选多段；完成后点“输出选中时间”",
                 foreground="purple",
             )
         else:
             self.selection_mode = False
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
+            self._clear_interaction_state()
             text = self._format_selected_time_ranges()
             if text:
                 self.root.clipboard_clear()
@@ -2757,8 +2911,7 @@ class BreathReducerApp:
             self.half_time_mode = False
             self.range_edit_mode = None
             self.picked_detected_segments = []
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
+            self._clear_interaction_state()
             self.status_label.config(
                 text="状态：选中处理片段模式已开启，点击绿色片段可累计选择，完成后再点“选择完成”",
                 foreground="purple",
@@ -2786,8 +2939,7 @@ class BreathReducerApp:
 
     def clear_selected_ranges(self):
         self.selected_ranges = []
-        self.drag_start_sec = None
-        self.drag_plot_kind = None
+        self._clear_interaction_state()
         self.status_label.config(text="状态：已清空所有选区", foreground="blue")
         self._update_selection_buttons()
         self.refresh_plots()
@@ -2807,16 +2959,14 @@ class BreathReducerApp:
             return
         if self.range_edit_mode == mode:
             self.range_edit_mode = None
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
+            self._clear_interaction_state()
             self.status_label.config(text="状态：已退出区间编辑模式", foreground="blue")
         else:
             self.range_edit_mode = mode
             self.selection_mode = False
             self.pick_detected_segment_mode = False
             self.half_time_mode = False
-            self.drag_start_sec = None
-            self.drag_plot_kind = None
+            self._clear_interaction_state()
             if mode == "add":
                 self.status_label.config(text="状态：等待手动选择，拖拽鼠标后会立即补充处理区间", foreground="purple")
             else:
