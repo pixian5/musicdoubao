@@ -2390,6 +2390,10 @@ class BreathReducerApp:
             else:
                 self.status_label.config(text="状态：已退出减半模式", foreground="blue")
             self.refresh_plots()                 # 无论命中与否，强制立即重绘，确保颜色更新
+            try:
+                self.root.update_idletasks()
+            except tk.TclError:
+                pass
             return
 
         if event.xdata is None:
