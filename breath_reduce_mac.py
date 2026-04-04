@@ -2397,7 +2397,7 @@ class BreathReducerApp:
                 self._apply_half_time_at_time(float(event.xdata), plot_kind)
             else:
                 self.status_label.config(text="状态：已退出减半模式", foreground="blue")
-            self._force_immediate_plot_refresh("HALF-TIME press refresh skipped")
+            self._force_immediate_plot_refresh("HALF-TIME press refresh")
             return
 
         if event.xdata is None:
@@ -2495,7 +2495,7 @@ class BreathReducerApp:
         if self._half_time_consumed:
             self._half_time_consumed = False
             # 在完整点击周期（press+release）结束时再提交一次重绘，避免需额外交互才可见
-            self._force_immediate_plot_refresh("HALF-TIME release refresh skipped")
+            self._force_immediate_plot_refresh("HALF-TIME release refresh")
             return
 
         # ── active resize 提交 ──
