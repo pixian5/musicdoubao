@@ -2393,7 +2393,8 @@ class BreathReducerApp:
             try:
                 self.root.update_idletasks()
             except tk.TclError:
-                pass
+                # 窗口销毁/关闭过程中可能触发 TclError；此处仅做最佳努力刷新，可安全忽略
+                _event_log("HALF-TIME refresh skipped: Tk widget already destroyed")
             return
 
         if event.xdata is None:
