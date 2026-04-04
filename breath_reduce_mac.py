@@ -2259,8 +2259,10 @@ class BreathReducerApp:
         self._draw_wave_envelope(self.ax_source, self.source_audio, "源文件音量谱", active=self.active_plot == "source", plot_kind="source")
         output_plot_audio = self.output_display_audio if self.output_display_audio is not None else self.output_audio
         self._draw_wave_envelope(self.ax_output, output_plot_audio, "输出文件音量谱", active=self.active_plot == "output", plot_kind="output")
-        self.canvas_source.draw_idle()
-        self.canvas_output.draw_idle()
+        self.canvas_source.draw()
+        self.canvas_output.draw()
+        self.canvas_source.flush_events()
+        self.canvas_output.flush_events()
         self.last_playhead_draw_ms = None
         self.sync_scrollbars()
 
