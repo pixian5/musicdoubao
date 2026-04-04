@@ -2266,6 +2266,14 @@ class BreathReducerApp:
         self.last_playhead_draw_ms = None
         self.sync_scrollbars()
 
+    def _force_immediate_plot_refresh(self, reason=None):
+        self.refresh_plots()
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            if reason:
+                _event_log(f"{reason}: Tk widget already destroyed")
+
     def sync_scrollbars(self):
         if self.source_audio is None or self.sr is None:
             return
@@ -2389,12 +2397,7 @@ class BreathReducerApp:
                 self._apply_half_time_at_time(float(event.xdata), plot_kind)
             else:
                 self.status_label.config(text="状态：已退出减半模式", foreground="blue")
-            self.refresh_plots()                 # 无论命中与否，强制立即重绘，确保颜色更新
-            try:
-                self.root.update_idletasks()
-            except tk.TclError:
-                # 窗口销毁/关闭过程中可能触发 TclError；此处仅做最佳努力刷新，可安全忽略
-                _event_log("HALF-TIME refresh skipped: Tk widget already destroyed")
+            self._force_immediate_plot_refresh("HALF-TIME press refresh skipped")
             return
 
         if event.xdata is None:
@@ -2492,11 +2495,7 @@ class BreathReducerApp:
         if self._half_time_consumed:
             self._half_time_consumed = False
             # 在完整点击周期（press+release）结束时再提交一次重绘，避免需额外交互才可见
-            self.refresh_plots()
-            try:
-                self.root.update_idletasks()
-            except tk.TclError:
-                _event_log("HALF-TIME release refresh skipped: Tk widget already destroyed")
+            self._force_immediate_plot_refresh("HALF-TIME release refresh skipped")
             return
 
         # ── active resize 提交 ──
