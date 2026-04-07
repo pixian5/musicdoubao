@@ -3,6 +3,10 @@ set -e
 
 cd "$(dirname "$0")"
 
+echo "0. 关闭正在运行的程序..."
+pkill -9 -f "吸气声弱化工具" || true
+sleep 1
+
 echo "1. 彻底清理旧产物..."
 rm -rf build dist __pycache__
 

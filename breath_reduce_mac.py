@@ -665,7 +665,7 @@ def _detect_low_voice_silence_segments(raw_rms, frame_time, sr, voice_floor_thre
     return _merge_segments(silence_mask, frame_time, sr, min_duration=0.08, max_duration=20.0)
 
 
-def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, percentile_reject_threshold=0.20, voice_floor_threshold=0.0):
+def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, percentile_reject_threshold=0.20, voice_floor_threshold=0.0, min_segment_length_ms=0.0):
     frame_time = HOP_LENGTH / sr
     rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
     flatness = librosa.feature.spectral_flatness(y=y, hop_length=HOP_LENGTH)[0]
@@ -1180,6 +1180,10 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         )
         filtered = _time_ranges_to_samples(filtered, sr, len(y))
 
+    if min_segment_length_ms > 0:
+        min_samples = int((min_segment_length_ms / 1000.0) * sr)
+        filtered = [(start, end) for start, end in filtered if (end - start) >= min_samples]
+
     durations = [float((end - start) / sr) for start, end in filtered]
     diagnostics = {
         "candidate_hits": int(np.count_nonzero(candidate_mask)),
@@ -1343,15 +1347,31 @@ def _intersect_time_ranges(base_ranges, target_range):
 
 def _build_half_time_segment(segment):
     segment = np.asarray(segment, dtype=np.float32)
-    if len(segment) <= 2:
-        return np.zeros(max(1, len(segment) // 2), dtype=np.float32)
     keep_len = max(1, len(segment) // 2)
+    if len(segment) <= 2:
+        if segment.ndim > 1:
+            return np.zeros((keep_len, segment.shape[1]), dtype=np.float32)
+        return np.zeros(keep_len, dtype=np.float32)
+        
     source_idx = np.linspace(0, len(segment) - 1, keep_len, dtype=np.float32)
-    compressed = np.interp(source_idx, np.arange(len(segment), dtype=np.float32), segment).astype(np.float32)
+    original_idx = np.arange(len(segment), dtype=np.float32)
+    
+    if segment.ndim > 1:
+        compressed = np.empty((keep_len, segment.shape[1]), dtype=np.float32)
+        for ch in range(segment.shape[1]):
+            compressed[:, ch] = np.interp(source_idx, original_idx, segment[:, ch])
+    else:
+        compressed = np.interp(source_idx, original_idx, segment).astype(np.float32)
+        
     fade_len = min(max(16, keep_len // 8), keep_len)
     if fade_len > 1:
-        compressed[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-        compressed[keep_len - fade_len : keep_len] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+        if compressed.ndim > 1:
+            fade_in = fade_in[:, None]
+            fade_out = fade_out[:, None]
+        compressed[:fade_len] *= fade_in
+        compressed[keep_len - fade_len:keep_len] *= fade_out
     return compressed
 
 
@@ -1681,6 +1701,7 @@ def process_breath(
     voice_floor_threshold=0.0,
     left_append_ms=LEFT_APPEND_MS,
     right_append_ms=RIGHT_APPEND_MS,
+    min_segment_length_ms=0.0,
 ):
     try:
         analysis_audio, playback_audio, sr = _load_audio_for_processing(input_path)
@@ -1691,6 +1712,7 @@ def process_breath(
             peak_reject_threshold,
             percentile_reject_threshold,
             voice_floor_threshold,
+            min_segment_length_ms,
         )
         breath_segments = _expand_segments(
             breath_segments,
@@ -1699,27 +1721,29 @@ def process_breath(
             left_append_ms=left_append_ms,
             right_append_ms=right_append_ms,
         )
-        y_processed_plot, output_timeline_segments = _render_output_audio(
+        limited_plot, limited_playback, output_headroom_gain = _finalize_rendered_output(
             analysis_audio,
+            playback_audio,
+            sr,
+        )
+        y_processed_plot, output_timeline_segments = _render_output_audio(
+            limited_plot,
             sr,
             breath_segments,
             atten_db=atten_db,
         )
         y_processed_playback, _ = _render_output_audio(
-            playback_audio,
+            limited_playback,
             sr,
             breath_segments,
             atten_db=atten_db,
-        )
-        y_processed_plot, y_processed_playback, output_headroom_gain = _finalize_rendered_output(
-            y_processed_plot,
-            y_processed_playback,
-            sr,
         )
         output_path = _build_output_path(input_path)
 
         return {
             "source_audio": analysis_audio,
+            "limited_source_audio": limited_plot,
+            "limited_playback_audio": limited_playback,
             "output_audio": y_processed_plot,
             "output_display_audio": y_processed_plot,
             "source_playback_audio": playback_audio,
@@ -1736,6 +1760,44 @@ def process_breath(
         raise RuntimeError(f"处理失败：{exc}") from exc
 
 
+class ColorButton(tk.Label):
+    def __init__(self, master, text, bg, fg="white", command=None, **kwargs):
+        super().__init__(master, text=text, bg="#d9d9d9", fg="#a3a3a3", padx=12, pady=4, relief="flat", cursor="arrow", **kwargs)
+        self.normal_bg = bg
+        self.normal_fg = fg
+        self.command = command
+        self._state = tk.DISABLED
+        
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_click(self, e):
+        if self._state == tk.DISABLED:
+            return
+        self.config(bg="#aaaaaa", state=tk.NORMAL)
+        self.after(100, lambda: self.config(bg=self.normal_bg, state=tk.NORMAL) if self._state != tk.DISABLED else None)
+        if self.command:
+            self.command()
+            
+    def _on_enter(self, e):
+        pass
+            
+    def _on_leave(self, e):
+        pass
+
+    def config(self, **kwargs):
+        if "state" in kwargs:
+            st = kwargs["state"]
+            self._state = st
+            if st == tk.DISABLED:
+                super().config(bg="#d9d9d9", fg="#a3a3a3", cursor="arrow")
+            else:
+                super().config(bg=self.normal_bg, fg=self.normal_fg, cursor="hand2")
+            kwargs.pop("state")
+        if kwargs:
+            super().config(**kwargs)
+
 class BreathReducerApp:
     def __init__(self, root):
         self.root = root
@@ -1747,6 +1809,8 @@ class BreathReducerApp:
         self.input_path = ""
         self.output_path = ""
         self.source_audio = None
+        self.limited_source_audio = None
+        self.limited_playback_audio = None
         self.output_audio = None
         self.output_display_audio = None
         self.source_playback_audio = None
@@ -1777,6 +1841,7 @@ class BreathReducerApp:
         self.voice_floor_var = tk.StringVar(value=str(self.app_config.get("voice_floor", 2)))
         self.left_append_ms_var = tk.StringVar(value=str(self.app_config.get("left_append_ms", LEFT_APPEND_MS)))
         self.right_append_ms_var = tk.StringVar(value=str(self.app_config.get("right_append_ms", RIGHT_APPEND_MS)))
+        self.min_segment_len_ms_var = tk.StringVar(value=str(self.app_config.get("min_segment_length_ms", 0.0)))
         self.export_bitrate_var = tk.StringVar(value=str(int(self.app_config.get("export_bitrate_kbps", 128))))
         self.active_plot = "source"
         self.selected_time_sec = None
@@ -1812,10 +1877,9 @@ class BreathReducerApp:
         top = ttk.Frame(self.root, padding=12)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="选择音频文件：").grid(row=0, column=0, sticky="w")
+        ttk.Button(top, text="选取文件", command=self.select_file).grid(row=0, column=0, sticky="w", pady=(10, 0))
         self.file_label = ttk.Label(top, text="未选择文件", foreground="gray")
-        self.file_label.grid(row=0, column=1, sticky="w", padx=(8, 12))
-        ttk.Button(top, text="浏览", command=self.select_file).grid(row=0, column=2, padx=6)
+        self.file_label.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 12))
 
         ttk.Label(top, text="衰减强度：").grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.atten_slider = tk.Scale(top, from_=10, to=30, orient=tk.HORIZONTAL, length=220)
@@ -1840,13 +1904,19 @@ class BreathReducerApp:
         ttk.Label(top, text="人声下限：").grid(row=3, column=0, sticky="w", pady=(10, 0))
         self.voice_floor_entry = ttk.Entry(top, textvariable=self.voice_floor_var, width=10)
         self.voice_floor_entry.grid(row=3, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(top, text="向左附加(毫秒)：").grid(row=3, column=2, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="按 0-100 输入，支持小数；低于此下限均按吸气处理", foreground="gray").grid(row=3, column=1, sticky="e", padx=(0, 50), pady=(10, 0))
+        ttk.Label(top, text="最短吸气声片段(毫秒)：").grid(row=3, column=2, sticky="w", pady=(10, 0))
+        self.min_segment_len_entry = ttk.Entry(top, textvariable=self.min_segment_len_ms_var, width=10)
+        self.min_segment_len_entry.grid(row=3, column=3, sticky="w", pady=(10, 0))
+
+        ttk.Label(top, text="向左附加(毫秒)：").grid(row=4, column=0, sticky="w", pady=(10, 0))
         self.left_append_entry = ttk.Entry(top, textvariable=self.left_append_ms_var, width=10)
-        self.left_append_entry.grid(row=3, column=3, sticky="w", pady=(10, 0))
-        ttk.Label(top, text="向右附加(毫秒)：").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.left_append_entry.grid(row=4, column=1, sticky="w", pady=(10, 0))
+        ttk.Label(top, text="向右附加(毫秒)：").grid(row=4, column=2, sticky="w", pady=(10, 0))
         self.right_append_entry = ttk.Entry(top, textvariable=self.right_append_ms_var, width=10)
-        self.right_append_entry.grid(row=4, column=1, sticky="w", pady=(10, 0))
-        ttk.Label(top, text="导出码率：").grid(row=4, column=2, sticky="w", pady=(10, 0))
+        self.right_append_entry.grid(row=4, column=3, sticky="w", pady=(10, 0))
+
+        ttk.Label(top, text="导出码率：").grid(row=5, column=0, sticky="w", pady=(10, 0))
         self.export_bitrate_combo = ttk.Combobox(
             top,
             textvariable=self.export_bitrate_var,
@@ -1854,21 +1924,25 @@ class BreathReducerApp:
             width=8,
             state="readonly",
         )
-        self.export_bitrate_combo.grid(row=4, column=3, sticky="w", pady=(10, 0))
-        ttk.Label(top, text="人声下限按 0-100 输入，支持小数；低于此下限的每一帧都会直接按吸气处理", foreground="gray").grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.export_bitrate_combo.grid(row=5, column=1, sticky="w", pady=(10, 0))
+
 
         buttons = ttk.Frame(top)
-        buttons.grid(row=6, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        buttons.grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
         self.process_btn = ttk.Button(buttons, text="重新处理当前文件", command=self.run_process, state=tk.DISABLED)
         self.process_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.export_btn = ttk.Button(buttons, text="导出", command=self.export_output_file, state=tk.DISABLED)
         self.export_btn.pack(side=tk.LEFT, padx=8)
         self.play_active_source_btn = ttk.Button(buttons, text="播放原文件", command=lambda: self.toggle_active_playback(False), state=tk.DISABLED)
         self.play_active_source_btn.pack(side=tk.LEFT, padx=8)
-        self.play_active_output_btn = ttk.Button(buttons, text="播放输出文件", command=lambda: self.toggle_active_playback(True), state=tk.DISABLED)
+        self.play_active_output_btn = ColorButton(buttons, text="播放输出文件", command=lambda: self.toggle_active_playback(True), bg="#4CAF50")
         self.play_active_output_btn.pack(side=tk.LEFT, padx=8)
-        self.half_time_btn = ttk.Button(buttons, text="区间时间减半", command=self.toggle_half_time_mode, state=tk.DISABLED)
+        self.half_time_btn = ColorButton(buttons, text="区间时间减半", command=self.toggle_half_time_mode, bg="#9C27B0")
         self.half_time_btn.pack(side=tk.LEFT, padx=8)
+        self.select_range_btn = ttk.Button(buttons, text="手动选择区间", command=lambda: self.toggle_range_edit_mode("add"), state=tk.DISABLED)
+        self.select_range_btn.pack(side=tk.LEFT, padx=8)
+        self.cancel_range_btn = ColorButton(buttons, text="取消选择", command=lambda: self.toggle_range_edit_mode("remove"), bg="#F44336")
+        self.cancel_range_btn.pack(side=tk.LEFT, padx=8)
         self.selection_mode_btn = ttk.Button(buttons, text="开启区间选择", command=self.toggle_selection_mode, state=tk.DISABLED)
         self.selection_mode_btn.pack(side=tk.LEFT, padx=8)
         self.pick_segment_btn = ttk.Button(buttons, text="选中处理片段", command=self.toggle_pick_detected_segment_mode, state=tk.DISABLED)
@@ -1877,10 +1951,6 @@ class BreathReducerApp:
         self.export_segments_btn.pack(side=tk.LEFT, padx=8)
         self.clear_selection_btn = ttk.Button(buttons, text="清空选区", command=self.clear_selected_ranges, state=tk.DISABLED)
         self.clear_selection_btn.pack(side=tk.LEFT, padx=8)
-        self.select_range_btn = ttk.Button(buttons, text="手动选择区间", command=lambda: self.toggle_range_edit_mode("add"), state=tk.DISABLED)
-        self.select_range_btn.pack(side=tk.LEFT, padx=8)
-        self.cancel_range_btn = ttk.Button(buttons, text="取消选择", command=lambda: self.toggle_range_edit_mode("remove"), state=tk.DISABLED)
-        self.cancel_range_btn.pack(side=tk.LEFT, padx=8)
         self.zoom_in_btn = ttk.Button(buttons, text="放大比例", command=lambda: self.adjust_zoom(0.5), state=tk.DISABLED)
         self.zoom_in_btn.pack(side=tk.LEFT, padx=8)
         self.zoom_out_btn = ttk.Button(buttons, text="缩小比例", command=lambda: self.adjust_zoom(2.0), state=tk.DISABLED)
@@ -1889,7 +1959,7 @@ class BreathReducerApp:
         self.reset_zoom_btn.pack(side=tk.LEFT, padx=8)
 
         self.status_label = ttk.Label(top, text="状态：等待操作", foreground="blue")
-        self.status_label.grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        self.status_label.grid(row=8, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         self.diagnostic_button = tk.Button(
             top,
@@ -1902,7 +1972,7 @@ class BreathReducerApp:
             wraplength=1120,
             cursor="hand2",
         )
-        self.diagnostic_button.grid(row=8, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        self.diagnostic_button.grid(row=9, column=0, columnspan=4, sticky="we", pady=(8, 0))
 
     def _build_plot(self):
         plot_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
@@ -2008,13 +2078,15 @@ class BreathReducerApp:
             left_append_ms = float(self.left_append_ms_var.get())
             right_append_ms = float(self.right_append_ms_var.get())
             bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
+            min_segment_length_ms = float(self.min_segment_len_ms_var.get())
         except ValueError:
-            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、向左附加、向右附加和导出码率都需要填写数字")
+            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、最短吸气声片段、向左附加、向右附加和导出码率都需要填写数字")
             return
 
         self.peak_reject_var.set(f"{peak_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
         self.percentile_reject_var.set(f"{percentile_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
         self.voice_floor_var.set(f"{voice_floor_threshold * 100:.2f}".rstrip("0").rstrip("."))
+        self.min_segment_len_ms_var.set(f"{min_segment_length_ms:.2f}".rstrip("0").rstrip("."))
         self.left_append_ms_var.set(f"{left_append_ms:.2f}".rstrip("0").rstrip("."))
         self.right_append_ms_var.set(f"{right_append_ms:.2f}".rstrip("0").rstrip("."))
         self.export_bitrate_var.set(str(bitrate_kbps))
@@ -2029,6 +2101,7 @@ class BreathReducerApp:
                 voice_floor_threshold,
                 left_append_ms,
                 right_append_ms,
+                min_segment_length_ms,
             )
         except RuntimeError as exc:
             self.status_label.config(text="状态：处理失败", foreground="red")
@@ -2036,6 +2109,8 @@ class BreathReducerApp:
             return
 
         self.source_audio = result["source_audio"]
+        self.limited_source_audio = result.get("limited_source_audio")
+        self.limited_playback_audio = result.get("limited_playback_audio")
         self.output_audio = result["output_audio"]
         self.output_display_audio = result.get("output_display_audio", result["output_audio"])
         self.source_playback_audio = result.get("source_playback_audio", result["source_audio"])
@@ -2386,18 +2461,36 @@ class BreathReducerApp:
             self._half_time_consumed = True      # 告知 motion/release 本次周期已被减半消费
             self._update_selection_buttons()
             if event.xdata is not None:
-                self._apply_half_time_at_time(float(event.xdata), plot_kind)
+                self.status_label.config(text="状态：正在处理，请稍候...", foreground="orange")
+                # 1. 立即应用减半范围的变更
+                worked = self._apply_half_time_at_time(float(event.xdata), plot_kind)
+                # 2. 立即重绘，这样画布上的区间可以立刻变紫
+                self.refresh_plots()
+                self.root.update()
+                
+                # 3. 延迟执行繁重的音频重计算操作，避免卡死并允许 UI 刷新
+                if worked:
+                    def rewrite_and_refresh():
+                        self._rewrite_output_from_current_segments()
+                        self.refresh_plots()
+                        self.status_label.config(text="状态：处理完成，已退出减半模式", foreground="blue")
+                    self.root.after(10, rewrite_and_refresh)
             else:
                 self.status_label.config(text="状态：已退出减半模式", foreground="blue")
-            self.refresh_plots()                 # 无论命中与否，强制立即重绘，确保颜色更新
-            try:
-                self.root.update_idletasks()
-            except tk.TclError:
-                pass
+                self.refresh_plots()
             return
 
         if event.xdata is None:
             return
+
+        # ── 强制清理可能因为 Mac 环境下 release 丢失导致残留的 active resize 状态 ──
+        if self.resize_segment_index is not None:
+            self.resize_segment_index = None
+            self.resize_edge = None
+            self.resize_preview_time = None
+            self.pending_resize_index = None
+            self.pending_resize_edge = None
+            self.pending_resize_press_time = None
 
         # ── resize handle 检测（pending 阶段：等待 motion 确认拖动意图）──
         self.pending_resize_index = None
@@ -2495,14 +2588,22 @@ class BreathReducerApp:
         # ── active resize 提交 ──
         if self.resize_segment_index is not None:
             new_time_sec = float(event.xdata) if event.xdata is not None else self.resize_preview_time
-            if new_time_sec is not None:
-                self._apply_segment_resize(self.resize_segment_index, self.resize_edge, new_time_sec)
+            segment_idx = self.resize_segment_index
+            edge = self.resize_edge
+
             self.resize_segment_index = None
             self.resize_edge = None
             self.resize_preview_time = None
             self.pending_resize_index = None
             self.pending_resize_edge = None
             self.pending_resize_press_time = None
+
+            if new_time_sec is not None:
+                self.status_label.config(text="状态：正在计算调整后的区间，请稍候...", foreground="orange")
+                self.root.update()
+                def do_resize():
+                    self._apply_segment_resize(segment_idx, edge, new_time_sec)
+                self.root.after(10, do_resize)
             return
 
         # ── pending resize 未达到拖动阈值 → 退化为普通点击 ──
@@ -2744,7 +2845,6 @@ class BreathReducerApp:
 
         self.selected_segment_index = best_index
         self._normalize_half_time_ranges()
-        self._rewrite_output_from_current_segments()
         self.status_label.config(
             text=f"状态：{action_text}紫色时间减半区间 {int(round(start_sec * 1000))}-{int(round(end_sec * 1000))}，已退出减半模式",
             foreground="purple",
@@ -2759,6 +2859,7 @@ class BreathReducerApp:
             "peak_reject": float(self.peak_reject_var.get() or 0),
             "percentile_reject": float(self.percentile_reject_var.get() or 0),
             "voice_floor": float(self.voice_floor_var.get() or 0),
+            "min_segment_length_ms": float(self.min_segment_len_ms_var.get() or 0),
             "left_append_ms": float(self.left_append_ms_var.get() or 0),
             "right_append_ms": float(self.right_append_ms_var.get() or 0),
         }
@@ -2783,24 +2884,27 @@ class BreathReducerApp:
             return
         self._stop_player()
         half_time_segments = _time_ranges_to_samples(self.half_time_ranges, self.sr, len(self.source_audio))
+        
+        base_source = self.limited_source_audio if self.limited_source_audio is not None else self.source_audio
         self.output_audio, self.output_timeline_segments = _render_output_audio(
-            self.source_audio,
+            base_source,
             self.sr,
             self.segments,
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
-        playback_source = self.source_playback_audio if self.source_playback_audio is not None else self.source_audio
+        
+        base_playback = self.limited_playback_audio if self.limited_playback_audio is not None else (self.source_playback_audio if self.source_playback_audio is not None else self.source_audio)
         self.output_playback_audio, _ = _render_output_audio(
-            playback_source,
+            base_playback,
             self.sr,
             self.segments,
             atten_db=self.atten_slider.get(),
             half_time_segments=half_time_segments,
         )
         self.output_display_audio = self.output_audio
-        self.output_headroom_gain = 1.0
-        self.output_has_post_processing = False
+        # Retain post-processing flag to true since we operate on limited audio
+        self.output_has_post_processing = True
 
     def _schedule_actual_output_refresh(self, output_file):
         self.export_refresh_token += 1
@@ -2842,8 +2946,7 @@ class BreathReducerApp:
 
         export_plot = np.asarray(self.output_audio, dtype=np.float32)
         export_playback = np.asarray(self.output_playback_audio, dtype=np.float32)
-        if not self.output_has_post_processing:
-            export_plot, export_playback, _ = _finalize_rendered_output(export_plot, export_playback, self.sr)
+
 
         self.output_path = str(_build_output_path(self.input_path))
         output_file = Path(self.output_path)
