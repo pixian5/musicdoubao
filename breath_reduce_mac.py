@@ -698,6 +698,13 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
     global_voice_p75 = float(np.percentile(raw_rms, 75))
     global_voice_p87 = float(np.percentile(raw_rms, 87))
     global_noise_p35 = float(np.percentile(raw_rms, 35))
+    # 动态气息能量上限：即使用户把 peak_reject 调高，也不允许超过音轨整体响度的
+    # 一定比例，防止把歌唱段误判为气息。上限 = min(用户阈值, p75*0.62)，
+    # 但不低于 0.05（保证低响度音轨仍有足够空间）。
+    breath_rms_cap = float(np.clip(
+        min(peak_reject_threshold, global_voice_p75 * 0.62),
+        0.05, peak_reject_threshold,
+    ))
 
     sensitivity = int(np.clip(sensitivity, 1, 10))
     energy_ceiling = np.clip(0.52 + (10 - sensitivity) * 0.045, 0.50, 0.92)
@@ -982,7 +989,7 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
             and pre_drop_ratio >= 2.2
             and lead_raw_mean >= mean_raw_rms * 1.45
         )
-        hard_peak_reject = max_raw_rms > (peak_reject_threshold + 1e-6)
+        hard_peak_reject = max_raw_rms > (breath_rms_cap + 1e-6)
         hard_percentile_reject = p90_raw_rms > (percentile_reject_threshold + 1e-6)
         voice_peak_reject = (
             duration <= 0.50
@@ -1011,9 +1018,31 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
             voice_floor_threshold > 0.0
             and duration <= 0.72
             and max_raw_rms <= voice_floor_threshold + 1e-6
+            and max_raw_rms <= breath_rms_cap + 1e-6
         )
 
-        keep = low_voice_force_keep or (
+        # 相对谷值气息：仅在用户主动提高 peak_reject（>0.08）时激活。
+        # 判断标准：段能量低于前后各1s的中位数，且前后都明显更高（真实谷值）。
+        # breath_rms_cap 仍然是上限，保证不会把响亮的歌声误判为气息。
+        valley_lead_raw = _sample_slice(raw_rms, max(0, start_frame - max(3, int(round(1.0 / frame_time)))), start_frame)
+        valley_follow_raw = _sample_slice(raw_rms, end_frame, end_frame + max(3, int(round(1.0 / frame_time))))
+        valley_lead_med = float(np.median(valley_lead_raw)) if len(valley_lead_raw) else 0.0
+        valley_follow_med = float(np.median(valley_follow_raw)) if len(valley_follow_raw) else 0.0
+        valley_ratio_lead = (valley_lead_med + 1e-6) / (mean_raw_rms + 1e-6)
+        valley_ratio_follow = (valley_follow_med + 1e-6) / (mean_raw_rms + 1e-6)
+        relative_valley_keep = (
+            peak_reject_threshold > 0.08
+            and not hard_peak_reject
+            and not hard_percentile_reject
+            and 0.05 <= duration <= 0.45
+            and valley_ratio_lead >= 2.0
+            and valley_ratio_follow >= 2.0
+            and valley_lead_med >= breath_rms_cap * 0.55
+            and valley_follow_med >= breath_rms_cap * 0.55
+            and mean_raw_rms <= breath_rms_cap * 0.75
+        )
+
+        keep = low_voice_force_keep or relative_valley_keep or (
             (0.05 <= duration <= 0.58)
             and (mean_score >= max(0.18, strict_threshold - 0.06))
             and (peak_score >= strict_threshold + 0.02)
@@ -1141,7 +1170,7 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         sr,
         frame_time,
         raw_rms,
-        peak_reject_threshold,
+        breath_rms_cap,
         percentile_reject_threshold,
     )
     filtered = _trim_rising_voice_right_edges(
@@ -1149,7 +1178,7 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         sr,
         frame_time,
         raw_rms,
-        peak_reject_threshold,
+        breath_rms_cap,
         percentile_reject_threshold,
         voice_floor_threshold,
     )
@@ -1158,7 +1187,7 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         sr,
         frame_time,
         raw_rms,
-        peak_reject_threshold,
+        breath_rms_cap,
         percentile_reject_threshold,
         voice_floor_threshold,
     )
@@ -1167,7 +1196,7 @@ def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, perc
         sr,
         frame_time,
         raw_rms,
-        peak_reject_threshold,
+        breath_rms_cap,
         voice_floor_threshold,
     )
     if floor_silence_segments:
