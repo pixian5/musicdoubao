@@ -36,7 +36,8 @@ def load_recordings(db_path: Path) -> list[dict]:
                 ZUNIQUEID,
                 COALESCE(NULLIF(ZENCRYPTEDTITLE, ''), NULLIF(ZCUSTOMLABELFORSORTING, ''), NULLIF(ZCUSTOMLABEL, '')) AS TITLE,
                 ZDATE,
-                ZDURATION
+                ZDURATION,
+                ZEVICTIONDATE
             FROM ZCLOUDRECORDING
             WHERE ZPATH IS NOT NULL
               AND ZPATH LIKE '%.m4a'
@@ -47,7 +48,7 @@ def load_recordings(db_path: Path) -> list[dict]:
         conn.close()
 
     items = []
-    for rel_path, unique_id, title, zdate, duration in rows:
+    for rel_path, unique_id, title, zdate, duration, eviction_date in rows:
         items.append(
             {
                 "source_name": rel_path,
@@ -55,9 +56,11 @@ def load_recordings(db_path: Path) -> list[dict]:
                 "title": (title or Path(rel_path).stem).strip(),
                 "zdate": zdate,
                 "duration": duration,
+                "is_recently_deleted": eviction_date is not None,
             }
         )
     return items
+
 
 
 def load_state(state_path: Path) -> dict:
@@ -192,6 +195,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
     state["items"] = state_items
     recordings = load_recordings(db_path)
     legacy_name_map = build_legacy_name_map(recordings)
+    recently_deleted_dir = target_dir / "最近删除"
     trash_dir = target_dir / DEFAULT_TRASH_DIR_NAME
     claimed_existing_names = set()
     source_name_index = build_source_name_index(state_items)
@@ -211,13 +215,15 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         unique_id = item["unique_id"]
         record_key = build_record_key(unique_id, source_name)
         title = item["title"]
+        is_recently_deleted = item["is_recently_deleted"]
         source_path = recordings_dir / source_name
         if not source_path.exists():
             missing_sources.append(source_name)
             continue
 
         target_name = build_target_name(title, source_name)
-        target_path = target_dir / target_name
+        current_dir = recently_deleted_dir if is_recently_deleted else target_dir
+        target_path = current_dir / target_name
         prev = state_items.get(record_key)
         if prev is None:
             fallback_key = source_name_index.get(source_name)
@@ -231,22 +237,34 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         if prev is None:
             prev = {}
         prev_name = prev.get("target_name")
-        prev_path = target_dir / prev_name if prev_name and is_m4a_name(str(prev_name)) else None
         source_size = source_path.stat().st_size
 
-        if prev_name and prev_name != target_name and prev_path and prev_path.exists():
-            if target_path.exists():
-                target_path.unlink()
-            prev_path.rename(target_path)
-            renamed += 1
-            claimed_existing_names.add(target_name)
+        if prev_name and is_m4a_name(str(prev_name)):
+            prev_active_path = target_dir / prev_name
+            prev_deleted_path = recently_deleted_dir / prev_name
+            prev_path = None
+            if prev_deleted_path.exists():
+                prev_path = prev_deleted_path
+            elif prev_active_path.exists():
+                prev_path = prev_active_path
+
+            if prev_path and (prev_name != target_name or prev_path != target_path):
+                if target_path.exists():
+                    target_path.unlink()
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                prev_path.rename(target_path)
+                renamed += 1
+                claimed_existing_names.add(target_name)
 
         if not prev_name and not target_path.exists():
             legacy_name = legacy_name_map.get(source_name)
             legacy_path = target_dir / legacy_name if legacy_name else None
+            legacy_deleted_path = recently_deleted_dir / legacy_name if legacy_name else None
             compat_path = None
             if legacy_path and legacy_path.exists():
                 compat_path = legacy_path
+            elif legacy_deleted_path and legacy_deleted_path.exists():
+                compat_path = legacy_deleted_path
             else:
                 compat_path = find_compat_existing_file(
                     target_dir,
@@ -255,21 +273,32 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
                     claimed_existing_names,
                     source_size,
                 )
+                if not compat_path:
+                    compat_path = find_compat_existing_file(
+                        recently_deleted_dir,
+                        title,
+                        source_name,
+                        claimed_existing_names,
+                        source_size,
+                    )
             if compat_path is not None and compat_path.exists():
-                if compat_path.name != target_name:
+                if compat_path != target_path:
                     if target_path.exists():
                         target_path.unlink()
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
                     compat_path.rename(target_path)
                     renamed += 1
                 claimed_existing_names.add(target_name)
 
         if not target_path.exists():
+            target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_path, target_path)
             copied += 1
         else:
             src_stat = source_path.stat()
             dst_stat = target_path.stat()
             if src_stat.st_size != dst_stat.st_size:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_path)
                 copied += 1
             else:
@@ -292,9 +321,17 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         target_name = str(item.get("target_name") or "")
         if not is_m4a_name(target_name):
             continue
-        target_path = target_dir / target_name
-        if move_to_trash(target_path, trash_dir) is not None:
-            trashed += 1
+        target_active_path = target_dir / target_name
+        target_deleted_path = recently_deleted_dir / target_name
+        target_path = None
+        if target_deleted_path.exists():
+            target_path = target_deleted_path
+        elif target_active_path.exists():
+            target_path = target_active_path
+
+        if target_path:
+            if move_to_trash(target_path, trash_dir) is not None:
+                trashed += 1
 
     state["items"] = next_state_items
     state["last_run_epoch"] = int(time.time())
