@@ -504,7 +504,18 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         current_dir = recently_deleted_dir if is_recently_deleted else target_dir
         target_path = current_dir / target_name
 
-        if prev_name and is_m4a_name(str(prev_name)):
+        # Only rename from prev_name when this record still exclusively owns that name
+        # (not already claimed by an earlier record this run). Prevents stealing
+        # another recording's file under corrupt/shared state.
+        owns_prev_name = (
+            bool(prev_name)
+            and is_m4a_name(str(prev_name))
+            and (
+                str(prev_name) == target_name
+                or str(prev_name) not in claimed_existing_names
+            )
+        )
+        if owns_prev_name:
             prev_path = locate_managed_target(target_dir, recently_deleted_dir, str(prev_name))
             # If both folders had the same name, remove the stale twin after preferring active.
             twin_active = target_dir / prev_name
@@ -515,12 +526,25 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
                 prev_path = twin_active
 
             if prev_path and (prev_name != target_name or prev_path != target_path):
-                action = safe_replace_move(prev_path, target_path, trash_dir)
-                if action == "renamed":
-                    renamed += 1
-                elif action == "trashed_conflict":
-                    renamed += 1
-                    conflicts += 1
+                # Extra safety: if another live state entry still points at prev_name,
+                # do not move it under this record.
+                other_owners = [
+                    key
+                    for key, other in state_items.items()
+                    if key != record_key
+                    and str(other.get("target_name") or "") == str(prev_name)
+                    and key not in seen_record_keys
+                ]
+                if other_owners and str(prev_name) != target_name:
+                    # Leave the shared file; this record will copy/create its own target.
+                    prev_path = None
+                if prev_path is not None:
+                    action = safe_replace_move(prev_path, target_path, trash_dir)
+                    if action == "renamed":
+                        renamed += 1
+                    elif action == "trashed_conflict":
+                        renamed += 1
+                        conflicts += 1
 
         if not prev_name and not target_path.exists():
             legacy_name = legacy_name_map.get(source_name)

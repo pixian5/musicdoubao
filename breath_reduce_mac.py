@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 60
+VERSION = 61
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -1995,8 +1995,11 @@ class BreathReducerApp:
         # Single generation counter for process / rewrite / export-refresh / select_file.
         # Any new op bumps op_token so in-flight applies from other ops are dropped.
         self.op_token = 0
+        self.busy_token = None
         self.is_busy = False
         self.segments_dirty = False
+        # Path that current in-memory buffers belong to (last successful process).
+        self.loaded_input_path = ""
         self.last_playback_anchor_sec = None
         self.last_playback_target = None
         self.sr = None
@@ -2225,6 +2228,30 @@ class BreathReducerApp:
         self.op_token += 1
         return self.op_token
 
+    def _release_busy_if_token(self, token, status_text=None, status_color="orange"):
+        """Clear busy only if this apply still owns the busy slot (or no owner recorded)."""
+        if not self.is_busy:
+            if status_text is not None:
+                self.status_label.config(text=status_text, foreground=status_color)
+            return
+        if self.busy_token is None or self.busy_token == token:
+            self._set_busy(False, status_text, status_color)
+            self.busy_token = None
+        elif status_text is not None:
+            # Superseded op: do not flip busy off under a newer owner.
+            pass
+
+    def _restore_loaded_path_ui(self, status_text, status_color="red"):
+        """Align input_path/label with last successfully loaded buffers."""
+        if self.loaded_input_path:
+            self.input_path = self.loaded_input_path
+            self.file_label.config(text=os.path.basename(self.loaded_input_path), foreground="green")
+        else:
+            self.input_path = ""
+            self.file_label.config(text="未选择文件", foreground="gray")
+        self.status_label.config(text=status_text, foreground=status_color)
+        self._set_busy(False, status_text, status_color)
+
     def select_file(self):
         if self.is_busy:
             messagebox.showinfo("提示", "当前正在处理，请稍候再选取文件")
@@ -2235,7 +2262,10 @@ class BreathReducerApp:
         )
         if not path:
             return
-        # Cancel any residual async apply (should already be idle) before switching path.
+        previous_path = self.loaded_input_path or self.input_path
+        previous_label = self.file_label.cget("text")
+        previous_label_color = self.file_label.cget("foreground")
+        # Cancel residual async applies before switching path.
         self._bump_op_token()
         self._clear_interaction_state()
         self.input_path = path
@@ -2243,16 +2273,24 @@ class BreathReducerApp:
         self.process_btn.config(state=tk.NORMAL)
         self.status_label.config(text="状态：已选择文件，正在自动处理...", foreground="orange")
         self.root.update_idletasks()
-        started = self.run_process(force=True)
+        started = self.run_process(force=True, previous_path_for_rollback=previous_path, previous_label_for_rollback=(previous_label, previous_label_color))
         if not started:
-            # Keep path (user chose it) but make status honest.
-            self.status_label.config(
-                text="状态：已选择文件，请点击“重新处理当前文件”",
-                foreground="blue",
-            )
+            # Roll back to last successful path so export cannot pair new name with old audio.
+            if previous_path:
+                self.input_path = previous_path
+                self.file_label.config(text=previous_label, foreground=previous_label_color)
+                self.status_label.config(text="状态：未开始处理，仍使用上一成功文件", foreground="blue")
+            else:
+                self.input_path = ""
+                self.file_label.config(text="未选择文件", foreground="gray")
+                self.status_label.config(text="状态：未开始处理", foreground="blue")
 
-    def _set_busy(self, busy, status_text=None, status_color="orange"):
+    def _set_busy(self, busy, status_text=None, status_color="orange", busy_token=None):
         self.is_busy = bool(busy)
+        if busy:
+            self.busy_token = busy_token if busy_token is not None else self.op_token
+        else:
+            self.busy_token = None
         if status_text is not None:
             self.status_label.config(text=status_text, foreground=status_color)
         # Selecting another file while busy desyncs path vs buffers — keep disabled.
@@ -2260,7 +2298,9 @@ class BreathReducerApp:
         process_state = tk.DISABLED if busy or not self.input_path else tk.NORMAL
         self.process_btn.config(state=process_state)
         has_audio = self.source_audio is not None and not busy
-        has_output = self.output_audio is not None and not busy
+        # Export only when path matches successfully loaded buffers.
+        path_ok = bool(self.loaded_input_path) and self.input_path == self.loaded_input_path
+        has_output = self.output_audio is not None and path_ok and not busy
         has_segments = bool(self.segments) and not busy
         click_play_state = tk.NORMAL if has_audio else tk.DISABLED
         export_state = tk.NORMAL if has_output else tk.DISABLED
@@ -2282,7 +2322,7 @@ class BreathReducerApp:
         self.source_scroll.config(state=zoom_state)
         self.output_scroll.config(state=zoom_state)
 
-    def _apply_process_result(self, result, previous_selected_time, previous_view_start, previous_view_duration, previous_active_plot):
+    def _apply_process_result(self, result, previous_selected_time, previous_view_start, previous_view_duration, previous_active_plot, source_path):
         self.source_audio = result["source_audio"]
         self.limited_source_audio = result.get("limited_source_audio")
         self.limited_playback_audio = result.get("limited_playback_audio")
@@ -2297,6 +2337,9 @@ class BreathReducerApp:
         self.segments = result["segments"]
         self.output_path = result["output_path"]
         self.last_diagnostics = result["diagnostics"]
+        self.input_path = source_path
+        self.loaded_input_path = source_path
+        self.file_label.config(text=os.path.basename(source_path), foreground="green")
         self.selected_segment_index = 0 if self.segments else None
         self.selected_time_sec = (self.segments[0][0] / self.sr) if self.segments else 0.0
         self.auto_segments = [
@@ -2336,7 +2379,7 @@ class BreathReducerApp:
         self._update_play_toggle_buttons()
         self.refresh_plots()
 
-    def run_process(self, force=False):
+    def run_process(self, force=False, previous_path_for_rollback=None, previous_label_for_rollback=None):
         """Start full reprocess. Returns True if a worker was started."""
         if not self.input_path:
             messagebox.showwarning("提示", "请先选择音频文件")
@@ -2359,6 +2402,8 @@ class BreathReducerApp:
         previous_view_start = float(self.current_view_start)
         previous_view_duration = float(self.current_view_duration)
         previous_active_plot = self.active_plot
+        rollback_path = previous_path_for_rollback if previous_path_for_rollback is not None else self.loaded_input_path
+        rollback_label = previous_label_for_rollback
 
         self._stop_player()
         self.source_playhead_line = None
@@ -2389,7 +2434,7 @@ class BreathReducerApp:
         atten_db = self.atten_slider.get()
         sensitivity = self.sensitivity_slider.get()
         token = self._bump_op_token()
-        self._set_busy(True, "状态：正在识别并生成内存预览...", "orange")
+        self._set_busy(True, "状态：正在识别并生成内存预览...", "orange", busy_token=token)
 
         def worker():
             try:
@@ -2411,9 +2456,21 @@ class BreathReducerApp:
 
             def apply():
                 if token != self.op_token:
+                    # Superseded: only release busy if we still own it.
+                    self._release_busy_if_token(token)
                     return
                 if error is not None:
-                    self._set_busy(False, "状态：处理失败", "red")
+                    # Roll path back to last successful load so export cannot mix names.
+                    if rollback_path:
+                        self.input_path = rollback_path
+                        if rollback_label:
+                            self.file_label.config(text=rollback_label[0], foreground=rollback_label[1])
+                        else:
+                            self.file_label.config(text=os.path.basename(rollback_path), foreground="green")
+                    elif self.loaded_input_path:
+                        self.input_path = self.loaded_input_path
+                        self.file_label.config(text=os.path.basename(self.loaded_input_path), foreground="green")
+                    self._release_busy_if_token(token, "状态：处理失败", "red")
                     messagebox.showerror("错误", str(error))
                     return
                 self._apply_process_result(
@@ -2422,6 +2479,7 @@ class BreathReducerApp:
                     previous_view_start,
                     previous_view_duration,
                     previous_active_plot,
+                    input_path,
                 )
 
             try:
@@ -2718,8 +2776,10 @@ class BreathReducerApp:
                 worked = self._apply_half_time_at_time(float(event.xdata), plot_kind)
                 # 2. 立即重绘，这样画布上的区间可以立刻变紫
                 self.refresh_plots()
-                self.root.update()
-                
+                # Prefer idle tasks only — root.update() re-enters the event loop
+                # before busy/token protect the follow-on rewrite.
+                self.root.update_idletasks()
+
                 # 3. 后台重算音频，避免卡死 UI
                 if worked:
                     self._rewrite_output_from_current_segments(
@@ -2867,8 +2927,13 @@ class BreathReducerApp:
             if new_time_sec is not None:
                 self.status_label.config(text="状态：正在计算调整后的区间，请稍候...", foreground="orange")
                 self.root.update_idletasks()
-                def do_resize():
-                    self._apply_segment_resize(segment_idx, edge, new_time_sec)
+                token = self.op_token
+
+                def do_resize(captured_token=token, idx=segment_idx, ed=edge, t=new_time_sec):
+                    if captured_token != self.op_token or self.is_busy:
+                        return
+                    self._apply_segment_resize(idx, ed, t)
+
                 self.root.after(10, do_resize)
             return
 
@@ -3204,7 +3269,7 @@ class BreathReducerApp:
             return
 
         token = self._bump_op_token()
-        self._set_busy(True, "状态：正在重算输出，请稍候...", "orange")
+        self._set_busy(True, "状态：正在重算输出，请稍候...", "orange", busy_token=token)
 
         def worker():
             try:
@@ -3218,13 +3283,14 @@ class BreathReducerApp:
 
             def apply():
                 if token != self.op_token:
+                    self._release_busy_if_token(token)
                     return
                 if error is not None:
-                    self._set_busy(False, "状态：重算失败", "red")
+                    self._release_busy_if_token(token, "状态：重算失败", "red")
                     messagebox.showerror("错误", str(error))
                     return
                 if result is None:
-                    self._set_busy(False)
+                    self._release_busy_if_token(token)
                     return
                 self.output_audio = result["output_audio"]
                 self.output_playback_audio = result["output_playback_audio"]
@@ -3232,7 +3298,7 @@ class BreathReducerApp:
                 self.output_display_audio = self.output_audio
                 self.output_has_post_processing = True
                 done_text = status_on_done or "状态：输出已更新"
-                self._set_busy(False, done_text, "blue")
+                self._release_busy_if_token(token, done_text, "blue")
                 self._update_selection_buttons()
                 self.refresh_plots()
 
@@ -3243,8 +3309,9 @@ class BreathReducerApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _schedule_actual_output_refresh(self, output_file):
-        token = self._bump_op_token()
+    def _schedule_actual_output_refresh(self, output_file, parent_token=None):
+        # Prefer parent export token so we do not invent a new generation while idle.
+        token = parent_token if parent_token is not None else self._bump_op_token()
 
         def worker():
             try:
@@ -3275,6 +3342,9 @@ class BreathReducerApp:
             return
         if self.is_busy:
             return
+        if not self.loaded_input_path or self.input_path != self.loaded_input_path:
+            messagebox.showwarning("提示", "当前显示的音频与所选文件不一致，请先成功处理后再导出")
+            return
         try:
             bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
         except ValueError:
@@ -3283,12 +3353,12 @@ class BreathReducerApp:
         self.export_bitrate_var.set(str(bitrate_kbps))
 
         export_playback = np.asarray(self.output_playback_audio, dtype=np.float32)
-        export_input_path = self.input_path
+        export_input_path = self.loaded_input_path
         self.output_path = str(_build_output_path(export_input_path))
         output_file = Path(self.output_path)
         sr = self.sr
         token = self._bump_op_token()
-        self._set_busy(True, "状态：正在导出 MP3...", "orange")
+        self._set_busy(True, "状态：正在导出 MP3...", "orange", busy_token=token)
 
         def worker():
             temp_out = output_file.with_name(f".{output_file.name}.partial")
@@ -3308,19 +3378,18 @@ class BreathReducerApp:
 
             def apply():
                 if token != self.op_token:
+                    self._release_busy_if_token(token)
                     return
                 if error is not None:
-                    self._set_busy(False, "状态：导出失败", "red")
+                    self._release_busy_if_token(token, "状态：导出失败", "red")
                     messagebox.showerror("错误", str(error))
                     return
-                # Keep same token for optional MP3 display refresh, but bump so later process cancels it.
-                # Actually refresh will bump again; capture current after busy clear.
-                self._set_busy(
-                    False,
+                self._release_busy_if_token(
+                    token,
                     f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
                     "green",
                 )
-                self._schedule_actual_output_refresh(output_file)
+                self._schedule_actual_output_refresh(output_file, parent_token=token)
 
             try:
                 self.root.after(0, apply)
@@ -3520,14 +3589,52 @@ class BreathReducerApp:
         self.segments_dirty = True
         self._rebuild_effective_segments(rewrite_output=True, async_rewrite=True, status_on_done=status_on_done)
 
+    def _map_half_time_on_resize(self, old_start, old_end, new_start, new_end):
+        """Remap half-time intervals intersecting [old_start, old_end] onto [new_start, new_end].
+
+        Only the overlapping portion of each half range is moved; non-overlapping
+        half ranges are left untouched. Does not expand partial half coverage to
+        the full new segment.
+        """
+        old_start = float(old_start)
+        old_end = float(old_end)
+        new_start = float(new_start)
+        new_end = float(new_end)
+        old_len = old_end - old_start
+        new_len = new_end - new_start
+        if old_len <= 1e-9 or new_len <= 1e-9:
+            return
+        remapped = []
+        kept = []
+        for hs, he in self.half_time_ranges:
+            hs = float(hs)
+            he = float(he)
+            ov_s = max(hs, old_start)
+            ov_e = min(he, old_end)
+            if ov_e <= ov_s:
+                kept.append((hs, he))
+                continue
+            # Drop the portion inside the old segment; keep outside remnants.
+            if hs < old_start:
+                kept.append((hs, min(he, old_start)))
+            if he > old_end:
+                kept.append((max(hs, old_end), he))
+            # Map the overlapped slice proportionally into the new segment.
+            r0 = (ov_s - old_start) / old_len
+            r1 = (ov_e - old_start) / old_len
+            mapped_s = new_start + r0 * new_len
+            mapped_e = new_start + r1 * new_len
+            if mapped_e > mapped_s:
+                remapped.append((mapped_s, mapped_e))
+        self.half_time_ranges = _merge_time_ranges(kept + remapped, min_gap_sec=0.0)
+
     def _apply_segment_resize(self, segment_index, edge, new_time_sec):
-        if self.sr is None or not (0 <= segment_index < len(self.segments)):
+        if self.is_busy or self.sr is None or not (0 <= segment_index < len(self.segments)):
             return
         total_duration = len(self.source_audio) / self.sr if self.source_audio is not None else 0.0
         effective_ranges = [(start / self.sr, end / self.sr) for start, end in self.segments]
         start_sec, end_sec = effective_ranges[segment_index]
         old_start_sec, old_end_sec = start_sec, end_sec
-        was_half_time = self._segment_is_half_time(old_start_sec, old_end_sec)
         new_time_sec = min(max(float(new_time_sec), 0.0), total_duration if total_duration > 0 else float(new_time_sec))
         min_width = 0.01
         if edge == "start":
@@ -3535,10 +3642,7 @@ class BreathReducerApp:
         else:
             end_sec = max(new_time_sec, start_sec + min_width)
         effective_ranges[segment_index] = (start_sec, end_sec)
-        if was_half_time:
-            # Move half-time coverage with the resized bounds.
-            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(old_start_sec, old_end_sec)])
-            self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
+        self._map_half_time_on_resize(old_start_sec, old_end_sec, start_sec, end_sec)
         self.segments_dirty = True
         self._replace_effective_segments(
             effective_ranges,

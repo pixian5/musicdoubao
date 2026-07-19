@@ -87,7 +87,28 @@ def test_build_target_name_collision_disambiguates():
 
 def test_op_token_exists():
     assert hasattr(m, "VERSION")
-    assert m.VERSION >= 60
+    assert m.VERSION >= 61
+    assert hasattr(m.BreathReducerApp, "_bump_op_token")
+    assert hasattr(m.BreathReducerApp, "_release_busy_if_token")
+    assert hasattr(m.BreathReducerApp, "_map_half_time_on_resize")
+
+
+def test_map_half_time_on_resize_preserves_partial():
+    """Partial half-time must not expand to the full resized segment."""
+
+    class _Dummy:
+        pass
+
+    app = _Dummy()
+    app.half_time_ranges = [(1.0, 2.0)]
+    # segment was [1,3], half only [1,2]; resize end to 3.5
+    m.BreathReducerApp._map_half_time_on_resize(app, 1.0, 3.0, 1.0, 3.5)
+    # proportional map: half covers first half of old length 2.0 → first 1.25 of new length 2.5
+    # r0=0, r1=0.5 → mapped [1.0, 2.25]
+    assert len(app.half_time_ranges) == 1
+    hs, he = app.half_time_ranges[0]
+    assert abs(hs - 1.0) < 1e-6
+    assert abs(he - 2.25) < 1e-6
 
 
 def test_resolve_under_blocks_traversal():
@@ -170,6 +191,7 @@ def main():
         test_build_target_name_no_nested_path,
         test_build_target_name_collision_disambiguates,
         test_op_token_exists,
+        test_map_half_time_on_resize_preserves_partial,
         test_resolve_under_blocks_traversal,
         test_missing_source_does_not_trash,
         test_conflict_goes_to_trash,

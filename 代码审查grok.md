@@ -1,27 +1,30 @@
 # 代码审查报告（Grok · v60 high）
 
 **审查日期**：2026-07-20  
-**审查对象**：`6af53e2`（`085d284...HEAD`）· `VERSION = 60`  
+**审查对象**：`6af53e2` 起至 **v61** 修复后 · `VERSION = 61`  
 **范围**：`breath_reduce_mac.py`、`sync_voice_memos.py`、`test_regressions.py` 等  
-**方法**：high effort 多角度扫描 + 对抗验证；`test_regressions.py` 11/11 通过  
+**方法**：high effort 多角度扫描 + 对抗验证；`test_regressions.py` **12/12** 通过  
 
 ---
 
 ## 执行摘要
 
-v60 相对 v57 已修好：重叠渲染、半速邻接合并、主线程阻塞、同步裸删/缺失源误 trash、目标名嵌套、token 互消、busy 门禁等。**当前无 Critical**。  
+v60–v61 相对 v57 已修好：重叠渲染、半速邻接合并、主线程阻塞、同步裸删/缺失源误 trash、目标名嵌套、统一 `op_token`、busy 门禁，以及 v61 追加的：
 
-仍开放的 **CONFIRMED 正确性** 集中在：
+- 选文件失败 **回滚路径** + `loaded_input_path` 与导出一致性  
+- resize **比例映射半速**（不扩大局部半速）  
+- `after(10)` resize **绑定 op_token + busy**  
+- process/rewrite/export token 失配时 **`_release_busy_if_token`**  
+- sync `prev_name` rename **所有权校验**  
 
-1. 选文件失败后 **路径与缓冲不同步**（可导出错误内容）  
-2. **resize 会扩大半速覆盖**  
+**当前无 Critical / 无开放 High 正确性项。**  
 
-「UI 整段紫色 / 音频子段半速」经对抗验证为 **有意粗粒度着色**，不记作正确性缺陷。其余多为效率与可维护性。
+「UI 整段紫色 / 音频子段半速」为 **有意粗粒度着色**。其余开放项多为效率与可维护性。
 
 | 级别 | 数量 |
 |------|------|
 | Critical | 0 |
-| High（正确性） | 2 |
+| High（正确性） | 0（P0 已修） |
 | Medium | 1（效率） |
 | Low / 清理 | 4+ |
 
@@ -44,6 +47,35 @@ v60 相对 v57 已修好：重叠渲染、半速邻接合并、主线程阻塞�
 - **现象**：`was_half_time = _segment_is_half_time(...)` 为 **任意相交**；为真则 `subtract` 整段旧区间再 `merge` 整段新区间。  
 - **失败场景**：段 [1,3]s 仅 [1,2]s 半速 → 拖右边界到 3.5s → 半速变成 [1,3.5]s，多削音频。  
 - **建议**：resize 时对 half 区间做仿射映射（只移动端点落在 half 上的部分），或 half 存相对段内比例。
+
+### [High] 延迟 `after(10)` resize 无 generation / busy 门禁
+
+- **文件**：`breath_reduce_mac.py:2870-2872`、`_apply_segment_resize`  
+- **判定**：CONFIRMED  
+- **现象**：`on_plot_release` 用 `root.after(10, do_resize)` 提交边界调整，回调 **不检查** `is_busy` / `op_token`。  
+- **失败场景**：拖边界松手 → 10ms 内点「重新处理」完成 → 延迟回调仍用旧 `segment_idx` 改 **新会话** 的 segments，并触发 rewrite。  
+- **建议**：捕获 `op_token`；回调开头 `if token != self.op_token or self.is_busy: return`；或去掉 after，直接调用并依赖 rewrite 异步。
+
+### [High] export apply 在 token 失配时不清理 busy
+
+- **文件**：`breath_reduce_mac.py:3310-3311`  
+- **判定**：CONFIRMED（代码路径）/ PLAUSIBLE（卡死需配合其它 bump）  
+- **现象**：
+
+  ```python
+  if token != self.op_token:
+      return  # 未 _set_busy(False)
+  ```
+
+  导出 worker 可能已写完 MP3；UI 若失配则永不解除 busy。延迟 resize 启动的 rewrite 通常会再清 busy，但任一侧 apply 被丢弃时可能卡住。  
+- **建议**：失配分支也 `_set_busy(False)`（或仅当 `self.is_busy and 无更新的 in-flight op`）；所有 apply 统一 finally 语义。
+
+### [Medium] 损坏 state 下 `prev_name` 重命名可能挪走他人文件
+
+- **文件**：`sync_voice_memos.py:517`  
+- **判定**：PLAUSIBLE  
+- **现象**：即使 `target_name` 已消歧，只要 `prev_name != target_name` 仍 `safe_replace_move(prev_path, target_path)`；若两记录曾共享 `prev_name`，后处理者会把文件挪到自己的新名。  
+- **建议**：仅当 `prev_name` 仍由本 `record_key` 独占（或内容 identity 匹配）时才 rename。
 
 ### [Info] UI 整段紫色 vs 渲染子段半速（有意设计，非正确性 bug）
 
@@ -112,10 +144,9 @@ v60 相对 v57 已修好：重叠渲染、半速邻接合并、主线程阻塞�
 
 ## 优先修复
 
-**P0**：选文件失败路径/缓冲一致性  
-**P0**：resize 半速映射不扩大  
-**P1**：半速 UI 与渲染语义统一  
-**P2**：双缓冲共享、async helper、sync twin helper  
+**P0（v61 已落地）**：选文件失败回滚 / resize 半速比例映射 / after(10) token / busy 安全释放 / prev_name 所有权  
+**P1**：双缓冲共享、单次段计划（效率）  
+**P2**：async helper 去重、sync twin helper、半速 UI 子区间着色（可选 WYSIWYG）  
 
 ---
 
