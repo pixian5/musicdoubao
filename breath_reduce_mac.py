@@ -15,13 +15,15 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 57
+VERSION = 60
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
 MIN_MANUAL_DRAG_SEC = 0.03
 MIN_RESIZE_DRAG_SEC = 0.02
 PLAYHEAD_DRAW_INTERVAL_MS = 120
+HALF_TIME_MATCH_TOLERANCE_SEC = 0.002
+LIMITER_CONTROL_RATE_HZ = 4000.0
 APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
 
 # ── 事件日志开关：设为 True 后每次鼠标事件都写到 ~/breath_event_log.txt ──
@@ -1277,7 +1279,7 @@ def _write_output_mp3(y_processed, sr, output_path, bitrate_kbps=128):
     sf.write(temp_wav.name, y_processed, sr, subtype="FLOAT")
     bitrate_kbps = int(np.clip(int(bitrate_kbps), 64, 320))
     try:
-        subprocess.run(
+        _run_ffmpeg(
             [
                 ffmpeg_bin,
                 "-y",
@@ -1289,9 +1291,7 @@ def _write_output_mp3(y_processed, sr, output_path, bitrate_kbps=128):
                 f"{bitrate_kbps}k",
                 str(output_path),
             ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            error_prefix="导出 MP3 失败",
         )
     finally:
         if os.path.exists(temp_wav.name):
@@ -1328,6 +1328,144 @@ def _merge_time_ranges(ranges, min_gap_sec=0.0):
         else:
             merged.append([start, end])
     return [(start, end) for start, end in merged]
+
+
+def _merge_sample_segments(segments, total_length=None):
+    """Merge overlapping/touching sample ranges so render never double-appends audio."""
+    cleaned = []
+    for start, end in segments or []:
+        start_i = int(start)
+        end_i = int(end)
+        if total_length is not None:
+            total_i = int(total_length)
+            start_i = max(0, min(start_i, total_i))
+            end_i = max(0, min(end_i, total_i))
+        if end_i > start_i:
+            cleaned.append((start_i, end_i))
+    if not cleaned:
+        return []
+    cleaned.sort(key=lambda item: (item[0], item[1]))
+    merged = [[cleaned[0][0], cleaned[0][1]]]
+    for start_i, end_i in cleaned[1:]:
+        prev = merged[-1]
+        if start_i <= prev[1]:
+            prev[1] = max(prev[1], end_i)
+        else:
+            merged.append([start_i, end_i])
+    return [(start_i, end_i) for start_i, end_i in merged]
+
+
+def _is_half_time_sample_segment(start, end, half_time_segments, sr, tolerance_sec=HALF_TIME_MATCH_TOLERANCE_SEC):
+    """True if this sample range intersects any half-time range (or matches within tolerance)."""
+    if not half_time_segments or end <= start:
+        return False
+    start = int(start)
+    end = int(end)
+    tol = max(1, int(round(float(tolerance_sec) * float(sr or 1))))
+    for half_start, half_end in half_time_segments:
+        hs = int(half_start)
+        he = int(half_end)
+        if he <= hs:
+            continue
+        if abs(hs - start) <= tol and abs(he - end) <= tol:
+            return True
+        if max(0, min(end, he) - max(start, hs)) > 0:
+            return True
+    return False
+
+
+def _half_time_overlaps_in_range(start, end, half_time_segments):
+    """Merged half-time sample ranges clipped to [start, end]."""
+    start = int(start)
+    end = int(end)
+    if end <= start or not half_time_segments:
+        return []
+    overlaps = []
+    for half_start, half_end in half_time_segments:
+        hs = max(start, int(half_start))
+        he = min(end, int(half_end))
+        if he > hs:
+            overlaps.append((hs, he))
+    return _merge_sample_segments(overlaps, total_length=end)
+
+
+def _split_segment_by_half_time(start, end, half_time_segments):
+    """
+    Split [start, end] into contiguous pieces tagged with half-time.
+    Ensures half-time still applies after breath segments are merged.
+    """
+    start = int(start)
+    end = int(end)
+    if end <= start:
+        return []
+    halves = _half_time_overlaps_in_range(start, end, half_time_segments)
+    if not halves:
+        return [(start, end, False)]
+    pieces = []
+    cursor = start
+    for hs, he in halves:
+        if hs > cursor:
+            pieces.append((cursor, hs, False))
+        pieces.append((hs, he, True))
+        cursor = he
+    if cursor < end:
+        pieces.append((cursor, end, False))
+    return pieces
+
+
+def _smooth_gain_attack_release(target_gain, sr, attack_sec, release_sec, control_rate_hz=LIMITER_CONTROL_RATE_HZ):
+    """Attack/release envelope with optional control-rate downsampling for speed."""
+    target_gain = np.asarray(target_gain, dtype=np.float32)
+    n = len(target_gain)
+    if n == 0:
+        return target_gain
+
+    hop = max(1, int(round(float(sr) / max(float(control_rate_hz), 1.0))))
+    if hop > 1 and n > hop * 4:
+        pad = (-n) % hop
+        padded = np.pad(target_gain, (0, pad), mode="edge")
+        blocks = padded.reshape(-1, hop)
+        # Prefer more reduction within each block so peaks stay limited after upsample.
+        coarse = np.min(blocks, axis=1).astype(np.float32)
+        coarse_sr = float(sr) / float(hop)
+        attack_coeff = float(np.exp(-1.0 / max(1.0, coarse_sr * attack_sec)))
+        release_coeff = float(np.exp(-1.0 / max(1.0, coarse_sr * release_sec)))
+        smooth = np.empty_like(coarse)
+        smooth[0] = coarse[0]
+        for idx in range(1, len(coarse)):
+            coeff = attack_coeff if coarse[idx] < smooth[idx - 1] else release_coeff
+            smooth[idx] = coeff * smooth[idx - 1] + (1.0 - coeff) * coarse[idx]
+        x_coarse = (np.arange(len(smooth), dtype=np.float32) + 0.5) * hop - 0.5
+        x_coarse = np.clip(x_coarse, 0.0, float(n - 1))
+        x_full = np.arange(n, dtype=np.float32)
+        return np.interp(x_full, x_coarse, smooth).astype(np.float32)
+
+    attack_coeff = float(np.exp(-1.0 / max(1.0, float(sr) * attack_sec)))
+    release_coeff = float(np.exp(-1.0 / max(1.0, float(sr) * release_sec)))
+    smooth = np.empty_like(target_gain)
+    smooth[0] = target_gain[0]
+    for idx in range(1, n):
+        coeff = attack_coeff if target_gain[idx] < smooth[idx - 1] else release_coeff
+        smooth[idx] = coeff * smooth[idx - 1] + (1.0 - coeff) * target_gain[idx]
+    return smooth
+
+
+def _run_ffmpeg(args, error_prefix="ffmpeg 失败"):
+    """Run ffmpeg and surface stderr tail on failure."""
+    try:
+        completed = subprocess.run(
+            args,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return completed
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{error_prefix}：找不到可执行文件 {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        tail = stderr_text[-800:] if stderr_text else "(无 stderr)"
+        raise RuntimeError(f"{error_prefix}：\n{tail}") from exc
 
 
 def _subtract_time_ranges(base_ranges, remove_ranges):
@@ -1454,7 +1592,10 @@ def _build_processed_segment(segment, sr, gain, half_time=False):
 def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments=None):
     source_audio = np.asarray(y, dtype=np.float32)
     gain = np.power(10, -atten_db / 20)
-    half_time_lookup = {(int(start), int(end)) for start, end in (half_time_segments or [])}
+    total_length = len(source_audio)
+    # Force non-overlapping sample ranges so cursor-based concat never double-counts.
+    breath_segments = _merge_sample_segments(breath_segments, total_length=total_length)
+    half_time_segments = _merge_sample_segments(half_time_segments or [], total_length=total_length)
     rendered_chunks = []
     timeline_segments = []
     cursor = 0
@@ -1462,9 +1603,14 @@ def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments
 
     for start, end in breath_segments:
         start = max(0, int(start))
-        end = min(int(end), len(source_audio))
+        end = min(int(end), total_length)
         if end <= start:
             continue
+        if start < cursor:
+            # Defensive: merged list should not overlap; clamp if it does.
+            start = cursor
+            if end <= start:
+                continue
         if start > cursor:
             chunk = np.asarray(source_audio[cursor:start], dtype=np.float32)
             rendered_chunks.append(chunk)
@@ -1472,19 +1618,22 @@ def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments
             timeline_segments.append((cursor, start, output_cursor, next_cursor))
             output_cursor = next_cursor
 
-        segment = np.asarray(source_audio[start:end], dtype=np.float32)
-        processed = _build_processed_segment(segment, sr, gain, half_time=(start, end) in half_time_lookup)
-        rendered_chunks.append(processed)
-        next_cursor = output_cursor + len(processed)
-        timeline_segments.append((start, end, output_cursor, next_cursor))
-        output_cursor = next_cursor
+        # Split by half-time intersections so merge of adjacent breath segments
+        # does not drop partial half-time ranges.
+        for piece_start, piece_end, use_half in _split_segment_by_half_time(start, end, half_time_segments):
+            segment = np.asarray(source_audio[piece_start:piece_end], dtype=np.float32)
+            processed = _build_processed_segment(segment, sr, gain, half_time=use_half)
+            rendered_chunks.append(processed)
+            next_cursor = output_cursor + len(processed)
+            timeline_segments.append((piece_start, piece_end, output_cursor, next_cursor))
+            output_cursor = next_cursor
         cursor = end
 
-    if cursor < len(source_audio):
+    if cursor < total_length:
         chunk = np.asarray(source_audio[cursor:], dtype=np.float32)
         rendered_chunks.append(chunk)
         next_cursor = output_cursor + len(chunk)
-        timeline_segments.append((cursor, len(source_audio), output_cursor, next_cursor))
+        timeline_segments.append((cursor, total_length, output_cursor, next_cursor))
         output_cursor = next_cursor
 
     if not rendered_chunks:
@@ -1508,7 +1657,7 @@ def _load_audio_for_processing(input_path):
     temp_wav = tempfile.NamedTemporaryFile(prefix="breath_input_decode_", suffix=".wav", delete=False)
     temp_wav.close()
     try:
-        subprocess.run(
+        _run_ffmpeg(
             [
                 ffmpeg_bin,
                 "-y",
@@ -1521,9 +1670,7 @@ def _load_audio_for_processing(input_path):
                 "pcm_f32le",
                 temp_wav.name,
             ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            error_prefix="解码音频失败",
         )
         y_full, sr = sf.read(temp_wav.name, dtype="float32", always_2d=False)
     finally:
@@ -1567,13 +1714,12 @@ def _apply_hot_peak_limiter(audio, sr, threshold=0.84):
         return audio.astype(np.float32)
     target_gain[hot_mask] = float(threshold) / np.maximum(control[hot_mask], 1e-6)
 
-    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.0008))
-    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.080))
-    gain_curve = np.ones_like(target_gain, dtype=np.float32)
-    gain_curve[0] = target_gain[0]
-    for idx in range(1, len(target_gain)):
-        coeff = attack_coeff if target_gain[idx] < gain_curve[idx - 1] else release_coeff
-        gain_curve[idx] = coeff * gain_curve[idx - 1] + (1.0 - coeff) * target_gain[idx]
+    gain_curve = _smooth_gain_attack_release(
+        target_gain,
+        sr,
+        attack_sec=0.0008,
+        release_sec=0.080,
+    )
 
     lookahead = max(1, int(round(sr * 0.004)))
     if len(gain_curve) > lookahead:
@@ -1666,13 +1812,12 @@ def _compute_loud_phrase_taming_gain(audio, sr):
     target_gain *= 1.0 - 0.32 * transient_hot
     target_gain = np.clip(target_gain, 0.38, 1.0)
 
-    attack_coeff = np.exp(-1.0 / max(1.0, sr * 0.0018))
-    release_coeff = np.exp(-1.0 / max(1.0, sr * 0.120))
-    smoothed_gain = np.ones_like(target_gain, dtype=np.float32)
-    smoothed_gain[0] = target_gain[0]
-    for idx in range(1, len(target_gain)):
-        coeff = attack_coeff if target_gain[idx] < smoothed_gain[idx - 1] else release_coeff
-        smoothed_gain[idx] = coeff * smoothed_gain[idx - 1] + (1.0 - coeff) * target_gain[idx]
+    smoothed_gain = _smooth_gain_attack_release(
+        target_gain,
+        sr,
+        attack_sec=0.0018,
+        release_sec=0.120,
+    )
     lookahead = max(1, int(round(sr * 0.008)))
     if len(smoothed_gain) > lookahead:
         lookahead_gain = smoothed_gain.copy()
@@ -1847,7 +1992,11 @@ class BreathReducerApp:
         self.output_headroom_gain = 1.0
         self.output_timeline_segments = []
         self.output_has_post_processing = False
-        self.export_refresh_token = 0
+        # Single generation counter for process / rewrite / export-refresh / select_file.
+        # Any new op bumps op_token so in-flight applies from other ops are dropped.
+        self.op_token = 0
+        self.is_busy = False
+        self.segments_dirty = False
         self.last_playback_anchor_sec = None
         self.last_playback_target = None
         self.sr = None
@@ -1906,7 +2055,8 @@ class BreathReducerApp:
         top = ttk.Frame(self.root, padding=12)
         top.pack(fill=tk.X)
 
-        ttk.Button(top, text="选取文件", command=self.select_file).grid(row=0, column=0, sticky="w", pady=(10, 0))
+        self.select_file_btn = ttk.Button(top, text="选取文件", command=self.select_file)
+        self.select_file_btn.grid(row=0, column=0, sticky="w", pady=(10, 0))
         self.file_label = ttk.Label(top, text="未选择文件", foreground="gray")
         self.file_label.grid(row=0, column=1, columnspan=2, sticky="w", padx=(8, 12))
 
@@ -2070,73 +2220,69 @@ class BreathReducerApp:
             ax.text(0.5, 0.5, "处理后显示音量谱与吸气片段", transform=ax.transAxes, ha="center", va="center", color="gray")
             canvas.draw_idle()
 
+    def _bump_op_token(self):
+        """Invalidate every in-flight process/rewrite/export-refresh apply."""
+        self.op_token += 1
+        return self.op_token
+
     def select_file(self):
+        if self.is_busy:
+            messagebox.showinfo("提示", "当前正在处理，请稍候再选取文件")
+            return
         path = filedialog.askopenfilename(
             title="选择音频文件",
             filetypes=[("音频文件", "*.wav *.mp3 *.m4a *.flac"), ("所有文件", "*.*")],
         )
         if not path:
             return
+        # Cancel any residual async apply (should already be idle) before switching path.
+        self._bump_op_token()
+        self._clear_interaction_state()
         self.input_path = path
         self.file_label.config(text=os.path.basename(path), foreground="green")
         self.process_btn.config(state=tk.NORMAL)
         self.status_label.config(text="状态：已选择文件，正在自动处理...", foreground="orange")
-        self.root.update()
-        self.run_process()
-
-    def run_process(self):
-        if not self.input_path:
-            messagebox.showwarning("提示", "请先选择音频文件")
-            return
-
-        previous_selected_time = float(self.selected_time_sec) if self.selected_time_sec is not None else None
-        previous_view_start = float(self.current_view_start)
-        previous_view_duration = float(self.current_view_duration)
-        previous_active_plot = self.active_plot
-
-        self._stop_player()
-        self.source_playhead_line = None
-        self.output_playhead_line = None
-        self.status_label.config(text="状态：正在识别并生成输出 MP3...", foreground="orange")
-        self.root.update()
-
-        try:
-            peak_reject_threshold = np.clip(float(self.peak_reject_var.get()), 0.0, 100.0) / 100.0
-            percentile_reject_threshold = np.clip(float(self.percentile_reject_var.get()), 0.0, 100.0) / 100.0
-            voice_floor_threshold = np.clip(float(self.voice_floor_var.get()), 0.0, 100.0) / 100.0
-            left_append_ms = float(self.left_append_ms_var.get())
-            right_append_ms = float(self.right_append_ms_var.get())
-            bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
-            min_segment_length_ms = float(self.min_segment_len_ms_var.get())
-        except ValueError:
-            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、最短吸气声片段、向左附加、向右附加和导出码率都需要填写数字")
-            return
-
-        self.peak_reject_var.set(f"{peak_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
-        self.percentile_reject_var.set(f"{percentile_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
-        self.voice_floor_var.set(f"{voice_floor_threshold * 100:.2f}".rstrip("0").rstrip("."))
-        self.min_segment_len_ms_var.set(f"{min_segment_length_ms:.2f}".rstrip("0").rstrip("."))
-        self.left_append_ms_var.set(f"{left_append_ms:.2f}".rstrip("0").rstrip("."))
-        self.right_append_ms_var.set(f"{right_append_ms:.2f}".rstrip("0").rstrip("."))
-        self.export_bitrate_var.set(str(bitrate_kbps))
-
-        try:
-            result = process_breath(
-                self.input_path,
-                self.atten_slider.get(),
-                self.sensitivity_slider.get(),
-                peak_reject_threshold,
-                percentile_reject_threshold,
-                voice_floor_threshold,
-                left_append_ms,
-                right_append_ms,
-                min_segment_length_ms,
+        self.root.update_idletasks()
+        started = self.run_process(force=True)
+        if not started:
+            # Keep path (user chose it) but make status honest.
+            self.status_label.config(
+                text="状态：已选择文件，请点击“重新处理当前文件”",
+                foreground="blue",
             )
-        except RuntimeError as exc:
-            self.status_label.config(text="状态：处理失败", foreground="red")
-            messagebox.showerror("错误", str(exc))
-            return
 
+    def _set_busy(self, busy, status_text=None, status_color="orange"):
+        self.is_busy = bool(busy)
+        if status_text is not None:
+            self.status_label.config(text=status_text, foreground=status_color)
+        # Selecting another file while busy desyncs path vs buffers — keep disabled.
+        self.select_file_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        process_state = tk.DISABLED if busy or not self.input_path else tk.NORMAL
+        self.process_btn.config(state=process_state)
+        has_audio = self.source_audio is not None and not busy
+        has_output = self.output_audio is not None and not busy
+        has_segments = bool(self.segments) and not busy
+        click_play_state = tk.NORMAL if has_audio else tk.DISABLED
+        export_state = tk.NORMAL if has_output else tk.DISABLED
+        segment_state = tk.NORMAL if has_segments else tk.DISABLED
+        self.export_btn.config(state=export_state)
+        self.half_time_btn.config(state=segment_state)
+        self.select_range_btn.config(state=click_play_state)
+        self.cancel_range_btn.config(state=click_play_state)
+        self.selection_mode_btn.config(state=click_play_state)
+        self.pick_segment_btn.config(state=click_play_state)
+        self.export_segments_btn.config(state=segment_state)
+        self.clear_selection_btn.config(state=click_play_state)
+        self.play_active_source_btn.config(state=click_play_state)
+        self.play_active_output_btn.config(state=click_play_state)
+        zoom_state = click_play_state
+        self.zoom_in_btn.config(state=zoom_state)
+        self.zoom_out_btn.config(state=zoom_state)
+        self.reset_zoom_btn.config(state=zoom_state)
+        self.source_scroll.config(state=zoom_state)
+        self.output_scroll.config(state=zoom_state)
+
+    def _apply_process_result(self, result, previous_selected_time, previous_view_start, previous_view_duration, previous_active_plot):
         self.source_audio = result["source_audio"]
         self.limited_source_audio = result.get("limited_source_audio")
         self.limited_playback_audio = result.get("limited_playback_audio")
@@ -2164,8 +2310,9 @@ class BreathReducerApp:
         self.picked_detected_segments = []
         self.selected_ranges = []
         self.half_time_ranges = []
-        self.drag_start_sec = None
-        self.drag_plot_kind = None
+        self.segments_dirty = False
+        # Drop any mid-drag / mid-resize state from the previous session.
+        self._clear_interaction_state()
         self.range_edit_mode = None
         total_duration = len(self.source_audio) / self.sr if self.source_audio is not None else 0.0
         self.current_view_duration = min(previous_view_duration, total_duration) if total_duration else previous_view_duration
@@ -2184,32 +2331,106 @@ class BreathReducerApp:
 
         self.debug_text.set(_format_diagnostics_text(self.last_diagnostics, len(self.segments)))
         self._save_current_config()
-        self.status_label.config(
-            text="状态：处理完成，当前显示为内存输出；点击“导出”才会写入磁盘",
-            foreground="green",
-        )
-        segment_state = tk.NORMAL if self.segments else tk.DISABLED
-        click_play_state = tk.NORMAL if self.source_audio is not None else tk.DISABLED
-        export_state = tk.NORMAL if self.output_audio is not None else tk.DISABLED
-        self.export_btn.config(state=export_state)
-        self.play_active_source_btn.config(state=click_play_state)
-        self.play_active_output_btn.config(state=click_play_state)
-        self.half_time_btn.config(state=segment_state)
-        self.selection_mode_btn.config(state=click_play_state)
-        self.pick_segment_btn.config(state=click_play_state)
-        self.export_segments_btn.config(state=segment_state)
-        self.clear_selection_btn.config(state=click_play_state)
-        self.select_range_btn.config(state=click_play_state)
-        self.cancel_range_btn.config(state=click_play_state)
-        zoom_state = tk.NORMAL if self.source_audio is not None else tk.DISABLED
-        self.zoom_in_btn.config(state=zoom_state)
-        self.zoom_out_btn.config(state=zoom_state)
-        self.reset_zoom_btn.config(state=zoom_state)
-        self.source_scroll.config(state=zoom_state)
-        self.output_scroll.config(state=zoom_state)
+        self._set_busy(False, "状态：处理完成，当前显示为内存输出；点击“导出”才会写入磁盘", "green")
         self._update_selection_buttons()
         self._update_play_toggle_buttons()
         self.refresh_plots()
+
+    def run_process(self, force=False):
+        """Start full reprocess. Returns True if a worker was started."""
+        if not self.input_path:
+            messagebox.showwarning("提示", "请先选择音频文件")
+            return False
+        if self.is_busy and not force:
+            return False
+
+        has_manual_edits = bool(
+            self.segments_dirty
+            or self.manual_segments
+            or self.half_time_ranges
+            or self.selected_ranges
+            or self.picked_detected_segments
+        )
+        if has_manual_edits and not force:
+            if not messagebox.askyesno("确认重新处理", "重新处理将清空手动区间、半速标记、边界调整和选区，是否继续？"):
+                return False
+
+        previous_selected_time = float(self.selected_time_sec) if self.selected_time_sec is not None else None
+        previous_view_start = float(self.current_view_start)
+        previous_view_duration = float(self.current_view_duration)
+        previous_active_plot = self.active_plot
+
+        self._stop_player()
+        self.source_playhead_line = None
+        self.output_playhead_line = None
+        self._clear_interaction_state()
+
+        try:
+            peak_reject_threshold = np.clip(float(self.peak_reject_var.get()), 0.0, 100.0) / 100.0
+            percentile_reject_threshold = np.clip(float(self.percentile_reject_var.get()), 0.0, 100.0) / 100.0
+            voice_floor_threshold = np.clip(float(self.voice_floor_var.get()), 0.0, 100.0) / 100.0
+            left_append_ms = max(0.0, float(self.left_append_ms_var.get()))
+            right_append_ms = max(0.0, float(self.right_append_ms_var.get()))
+            bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
+            min_segment_length_ms = max(0.0, float(self.min_segment_len_ms_var.get()))
+        except ValueError:
+            messagebox.showwarning("提示", "吸气最大峰值、吸气最大整体音量、人声下限、最短吸气声片段、向左附加、向右附加和导出码率都需要填写数字")
+            return False
+
+        self.peak_reject_var.set(f"{peak_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
+        self.percentile_reject_var.set(f"{percentile_reject_threshold * 100:.2f}".rstrip("0").rstrip("."))
+        self.voice_floor_var.set(f"{voice_floor_threshold * 100:.2f}".rstrip("0").rstrip("."))
+        self.min_segment_len_ms_var.set(f"{min_segment_length_ms:.2f}".rstrip("0").rstrip("."))
+        self.left_append_ms_var.set(f"{left_append_ms:.2f}".rstrip("0").rstrip("."))
+        self.right_append_ms_var.set(f"{right_append_ms:.2f}".rstrip("0").rstrip("."))
+        self.export_bitrate_var.set(str(bitrate_kbps))
+
+        input_path = self.input_path
+        atten_db = self.atten_slider.get()
+        sensitivity = self.sensitivity_slider.get()
+        token = self._bump_op_token()
+        self._set_busy(True, "状态：正在识别并生成内存预览...", "orange")
+
+        def worker():
+            try:
+                result = process_breath(
+                    input_path,
+                    atten_db,
+                    sensitivity,
+                    peak_reject_threshold,
+                    percentile_reject_threshold,
+                    voice_floor_threshold,
+                    left_append_ms,
+                    right_append_ms,
+                    min_segment_length_ms,
+                )
+                error = None
+            except Exception as exc:
+                result = None
+                error = exc
+
+            def apply():
+                if token != self.op_token:
+                    return
+                if error is not None:
+                    self._set_busy(False, "状态：处理失败", "red")
+                    messagebox.showerror("错误", str(error))
+                    return
+                self._apply_process_result(
+                    result,
+                    previous_selected_time,
+                    previous_view_start,
+                    previous_view_duration,
+                    previous_active_plot,
+                )
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def _compute_envelope(self, audio):
         if audio is None or self.sr is None:
@@ -2481,6 +2702,8 @@ class BreathReducerApp:
     def on_plot_press(self, event, plot_kind):
         if self.sr is None:
             return
+        if self.is_busy:
+            return
 
         _event_log(f"PRESS  plot={plot_kind} x={event.xdata} half={self.half_time_mode} resize_pending={self.pending_resize_index} resize_active={self.resize_segment_index}")
 
@@ -2497,13 +2720,12 @@ class BreathReducerApp:
                 self.refresh_plots()
                 self.root.update()
                 
-                # 3. 延迟执行繁重的音频重计算操作，避免卡死并允许 UI 刷新
+                # 3. 后台重算音频，避免卡死 UI
                 if worked:
-                    def rewrite_and_refresh():
-                        self._rewrite_output_from_current_segments()
-                        self.refresh_plots()
-                        self.status_label.config(text="状态：处理完成，已退出减半模式", foreground="blue")
-                    self.root.after(10, rewrite_and_refresh)
+                    self._rewrite_output_from_current_segments(
+                        async_mode=True,
+                        status_on_done="状态：处理完成，已退出减半模式",
+                    )
             else:
                 self.status_label.config(text="状态：已退出减半模式", foreground="blue")
                 self.refresh_plots()
@@ -2569,6 +2791,8 @@ class BreathReducerApp:
     def on_plot_motion(self, event, plot_kind):
         if event.xdata is None or self.sr is None:
             return
+        if self.is_busy:
+            return
 
         # ── 减半模式（或本次 press 已被减半消费）：motion 期间完全忽略 ──
         if self.half_time_mode or self._half_time_consumed:
@@ -2601,10 +2825,23 @@ class BreathReducerApp:
             self.active_plot = plot_kind
             self.resize_preview_time = float(event.xdata)
             self.selected_time_sec = float(event.xdata)
-            self._update_playhead_display(force_refresh=True)
+            # Throttle full redraw during drag (was force-refresh every motion event).
+            now_ms = int(self.root.winfo_toplevel().tk.call("clock", "milliseconds"))
+            if self.last_playhead_draw_ms is None or (now_ms - self.last_playhead_draw_ms) >= PLAYHEAD_DRAW_INTERVAL_MS:
+                self._update_playhead_display(force_refresh=True)
+                self.last_playhead_draw_ms = now_ms
+            else:
+                self._update_playhead_display(force_refresh=False)
 
     def on_plot_release(self, event, plot_kind):
         if self.sr is None:
+            return
+        # Hard-block all plot completion while busy so mid-drag cannot schedule rewrite
+        # over a concurrent process/export.
+        if self.is_busy:
+            self._clear_interaction_state()
+            self.drag_start_sec = None
+            self.drag_plot_kind = None
             return
 
         _event_log(f"RELEASE plot={plot_kind} x={event.xdata} half={self.half_time_mode} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
@@ -2629,7 +2866,7 @@ class BreathReducerApp:
 
             if new_time_sec is not None:
                 self.status_label.config(text="状态：正在计算调整后的区间，请稍候...", foreground="orange")
-                self.root.update()
+                self.root.update_idletasks()
                 def do_resize():
                     self._apply_segment_resize(segment_idx, edge, new_time_sec)
                 self.root.after(10, do_resize)
@@ -2863,16 +3100,15 @@ class BreathReducerApp:
         end_sec = end / self.sr
 
         if self._segment_is_half_time(start_sec, end_sec):
-            self.half_time_ranges = [
-                item for item in self.half_time_ranges
-                if not (abs(item[0] - start_sec) <= 0.002 and abs(item[1] - end_sec) <= 0.002)
-            ]
+            # Cancel half-time on any overlapping portion of this effective segment.
+            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(start_sec, end_sec)])
             action_text = "已取消"
         else:
             self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
             action_text = "已设为"
 
         self.selected_segment_index = best_index
+        self.segments_dirty = True
         self._normalize_half_time_ranges()
         self.status_label.config(
             text=f"状态：{action_text}紫色时间减半区间 {int(round(start_sec * 1000))}-{int(round(end_sec * 1000))}，已退出减半模式",
@@ -2895,49 +3131,120 @@ class BreathReducerApp:
         _save_app_config(self.app_config)
 
     def _segment_is_half_time(self, start_sec, end_sec):
-        for half_start, half_end in self.half_time_ranges:
-            if abs(half_start - start_sec) <= 0.002 and abs(half_end - end_sec) <= 0.002:
-                return True
-        return False
+        if self.sr is None:
+            return False
+        start_sample = int(round(float(start_sec) * self.sr))
+        end_sample = int(round(float(end_sec) * self.sr))
+        half_samples = _time_ranges_to_samples(self.half_time_ranges, self.sr, max(end_sample, 1))
+        return _is_half_time_sample_segment(start_sample, end_sample, half_samples, self.sr)
 
     def _normalize_half_time_ranges(self):
-        effective_ranges = [(start / self.sr, end / self.sr) for start, end in self.segments] if self.sr is not None else []
-        normalized = []
-        for start_sec, end_sec in effective_ranges:
-            if self._segment_is_half_time(start_sec, end_sec):
-                normalized.append((start_sec, end_sec))
-        self.half_time_ranges = normalized
+        """Keep half-time ranges clipped to current effective segments (intersection, not exact match)."""
+        if self.sr is None or not self.segments:
+            self.half_time_ranges = []
+            return
+        effective_ranges = [(start / self.sr, end / self.sr) for start, end in self.segments]
+        clipped = []
+        for half_start, half_end in self.half_time_ranges:
+            for seg_start, seg_end in effective_ranges:
+                overlap_start = max(float(half_start), float(seg_start))
+                overlap_end = min(float(half_end), float(seg_end))
+                if overlap_end > overlap_start:
+                    clipped.append((overlap_start, overlap_end))
+        self.half_time_ranges = _merge_time_ranges(clipped, min_gap_sec=0.0)
 
-    def _rewrite_output_from_current_segments(self):
+    def _compute_rewrite_outputs(self, segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len):
+        """CPU-heavy rewrite path; safe to call off the UI thread with snapshots."""
+        half_time_segments = _time_ranges_to_samples(half_time_ranges, sr, source_len)
+        output_audio, timeline = _render_output_audio(
+            base_source,
+            sr,
+            segments,
+            atten_db=atten_db,
+            half_time_segments=half_time_segments,
+        )
+        output_playback, _ = _render_output_audio(
+            base_playback,
+            sr,
+            segments,
+            atten_db=atten_db,
+            half_time_segments=half_time_segments,
+        )
+        return {
+            "output_audio": output_audio,
+            "output_playback_audio": output_playback,
+            "output_timeline_segments": timeline,
+        }
+
+    def _rewrite_output_from_current_segments(self, async_mode=False, status_on_done=None):
         if self.source_audio is None or self.sr is None:
             return
         self._stop_player()
-        half_time_segments = _time_ranges_to_samples(self.half_time_ranges, self.sr, len(self.source_audio))
-        
+        segments = list(self.segments)
+        half_time_ranges = list(self.half_time_ranges)
+        atten_db = self.atten_slider.get()
+        sr = self.sr
+        source_len = len(self.source_audio)
         base_source = self.limited_source_audio if self.limited_source_audio is not None else self.source_audio
-        self.output_audio, self.output_timeline_segments = _render_output_audio(
-            base_source,
-            self.sr,
-            self.segments,
-            atten_db=self.atten_slider.get(),
-            half_time_segments=half_time_segments,
+        base_playback = self.limited_playback_audio if self.limited_playback_audio is not None else (
+            self.source_playback_audio if self.source_playback_audio is not None else self.source_audio
         )
-        
-        base_playback = self.limited_playback_audio if self.limited_playback_audio is not None else (self.source_playback_audio if self.source_playback_audio is not None else self.source_audio)
-        self.output_playback_audio, _ = _render_output_audio(
-            base_playback,
-            self.sr,
-            self.segments,
-            atten_db=self.atten_slider.get(),
-            half_time_segments=half_time_segments,
-        )
-        self.output_display_audio = self.output_audio
-        # Retain post-processing flag to true since we operate on limited audio
-        self.output_has_post_processing = True
+
+        if not async_mode:
+            result = self._compute_rewrite_outputs(
+                segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len
+            )
+            if result is None:
+                return
+            self.output_audio = result["output_audio"]
+            self.output_playback_audio = result["output_playback_audio"]
+            self.output_timeline_segments = result["output_timeline_segments"]
+            self.output_display_audio = self.output_audio
+            self.output_has_post_processing = True
+            return
+
+        token = self._bump_op_token()
+        self._set_busy(True, "状态：正在重算输出，请稍候...", "orange")
+
+        def worker():
+            try:
+                result = self._compute_rewrite_outputs(
+                    segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len
+                )
+                error = None
+            except Exception as exc:
+                result = None
+                error = exc
+
+            def apply():
+                if token != self.op_token:
+                    return
+                if error is not None:
+                    self._set_busy(False, "状态：重算失败", "red")
+                    messagebox.showerror("错误", str(error))
+                    return
+                if result is None:
+                    self._set_busy(False)
+                    return
+                self.output_audio = result["output_audio"]
+                self.output_playback_audio = result["output_playback_audio"]
+                self.output_timeline_segments = result["output_timeline_segments"]
+                self.output_display_audio = self.output_audio
+                self.output_has_post_processing = True
+                done_text = status_on_done or "状态：输出已更新"
+                self._set_busy(False, done_text, "blue")
+                self._update_selection_buttons()
+                self.refresh_plots()
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _schedule_actual_output_refresh(self, output_file):
-        self.export_refresh_token += 1
-        token = self.export_refresh_token
+        token = self._bump_op_token()
 
         def worker():
             try:
@@ -2946,7 +3253,7 @@ class BreathReducerApp:
                 return
 
             def apply_result():
-                if token != self.export_refresh_token:
+                if token != self.op_token:
                     return
                 self.output_display_audio = actual_audio
                 self.refresh_plots()
@@ -2966,6 +3273,8 @@ class BreathReducerApp:
         if self.output_audio is None or self.output_playback_audio is None or self.sr is None or not self.input_path:
             self.status_label.config(text="状态：当前没有可导出的输出", foreground="blue")
             return
+        if self.is_busy:
+            return
         try:
             bitrate_kbps = int(np.clip(int(self.export_bitrate_var.get()), 64, 320))
         except ValueError:
@@ -2973,20 +3282,52 @@ class BreathReducerApp:
             return
         self.export_bitrate_var.set(str(bitrate_kbps))
 
-        export_plot = np.asarray(self.output_audio, dtype=np.float32)
         export_playback = np.asarray(self.output_playback_audio, dtype=np.float32)
-
-
-        self.output_path = str(_build_output_path(self.input_path))
+        export_input_path = self.input_path
+        self.output_path = str(_build_output_path(export_input_path))
         output_file = Path(self.output_path)
-        if output_file.exists():
-            output_file.unlink()
-        _write_output_mp3(export_playback, self.sr, output_file, bitrate_kbps=bitrate_kbps)
-        self.status_label.config(
-            text=f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
-            foreground="green",
-        )
-        self._schedule_actual_output_refresh(output_file)
+        sr = self.sr
+        token = self._bump_op_token()
+        self._set_busy(True, "状态：正在导出 MP3...", "orange")
+
+        def worker():
+            temp_out = output_file.with_name(f".{output_file.name}.partial")
+            try:
+                if temp_out.exists():
+                    temp_out.unlink()
+                _write_output_mp3(export_playback, sr, temp_out, bitrate_kbps=bitrate_kbps)
+                temp_out.replace(output_file)
+                error = None
+            except Exception as exc:
+                error = exc
+                try:
+                    if temp_out.exists():
+                        temp_out.unlink()
+                except OSError:
+                    pass
+
+            def apply():
+                if token != self.op_token:
+                    return
+                if error is not None:
+                    self._set_busy(False, "状态：导出失败", "red")
+                    messagebox.showerror("错误", str(error))
+                    return
+                # Keep same token for optional MP3 display refresh, but bump so later process cancels it.
+                # Actually refresh will bump again; capture current after busy clear.
+                self._set_busy(
+                    False,
+                    f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
+                    "green",
+                )
+                self._schedule_actual_output_refresh(output_file)
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
@@ -3004,6 +3345,8 @@ class BreathReducerApp:
     def toggle_half_time_mode(self):
         if self.sr is None or not self.segments:
             return
+        if self.is_busy:
+            return
         self.half_time_mode = not self.half_time_mode
         self._clear_interaction_state()
         if self.half_time_mode:
@@ -3017,6 +3360,8 @@ class BreathReducerApp:
         self.refresh_plots()
 
     def toggle_selection_mode(self):
+        if self.is_busy:
+            return
         if not self.selection_mode:
             self.selection_mode = True
             self.pick_detected_segment_mode = False
@@ -3044,6 +3389,8 @@ class BreathReducerApp:
         self.refresh_plots()
 
     def toggle_pick_detected_segment_mode(self):
+        if self.is_busy:
+            return
         if not self.pick_detected_segment_mode:
             self.pick_detected_segment_mode = True
             self.selection_mode = False
@@ -3096,6 +3443,8 @@ class BreathReducerApp:
     def toggle_range_edit_mode(self, mode):
         if self.source_audio is None or self.sr is None:
             return
+        if self.is_busy:
+            return
         if self.range_edit_mode == mode:
             self.range_edit_mode = None
             self._clear_interaction_state()
@@ -3113,7 +3462,7 @@ class BreathReducerApp:
         self._update_selection_buttons()
         self.refresh_plots()
 
-    def _rebuild_effective_segments(self, rewrite_output=True):
+    def _rebuild_effective_segments(self, rewrite_output=True, async_rewrite=True, status_on_done=None):
         if self.source_audio is None or self.sr is None:
             return
         effective_ranges = _merge_time_ranges(self.auto_segments + self.manual_segments, min_gap_sec=0.002)
@@ -3126,7 +3475,10 @@ class BreathReducerApp:
             self.selected_segment_index = 0
 
         if rewrite_output:
-            self._rewrite_output_from_current_segments()
+            self._rewrite_output_from_current_segments(
+                async_mode=async_rewrite,
+                status_on_done=status_on_done,
+            )
 
     def _find_clicked_effective_range(self, clicked_time):
         candidates = []
@@ -3161,11 +3513,12 @@ class BreathReducerApp:
                     best_distance = distance
         return best
 
-    def _replace_effective_segments(self, ranges_sec):
+    def _replace_effective_segments(self, ranges_sec, status_on_done=None):
         merged = _merge_time_ranges(ranges_sec, min_gap_sec=0.002)
         self.auto_segments = list(merged)
         self.manual_segments = []
-        self._rebuild_effective_segments(rewrite_output=True)
+        self.segments_dirty = True
+        self._rebuild_effective_segments(rewrite_output=True, async_rewrite=True, status_on_done=status_on_done)
 
     def _apply_segment_resize(self, segment_index, edge, new_time_sec):
         if self.sr is None or not (0 <= segment_index < len(self.segments)):
@@ -3182,19 +3535,20 @@ class BreathReducerApp:
         else:
             end_sec = max(new_time_sec, start_sec + min_width)
         effective_ranges[segment_index] = (start_sec, end_sec)
-        self._replace_effective_segments(effective_ranges)
         if was_half_time:
-            self.half_time_ranges = [
-                item for item in self.half_time_ranges
-                if not (abs(item[0] - old_start_sec) <= 0.002 and abs(item[1] - old_end_sec) <= 0.002)
-            ]
+            # Move half-time coverage with the resized bounds.
+            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(old_start_sec, old_end_sec)])
             self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
-            self._normalize_half_time_ranges()
-            self._rewrite_output_from_current_segments()
+        self.segments_dirty = True
+        self._replace_effective_segments(
+            effective_ranges,
+            status_on_done=f"状态：已调整绿色片段范围到 {start_sec:.2f}s - {end_sec:.2f}s",
+        )
         self.selected_segment_index = min(segment_index, len(self.segments) - 1) if self.segments else None
         self.selected_time_sec = start_sec if edge == "start" else end_sec
+        # refresh happens when async rewrite finishes; show provisional status
         self.status_label.config(
-            text=f"状态：已调整绿色片段范围到 {start_sec:.2f}s - {end_sec:.2f}s",
+            text=f"状态：已调整绿色片段范围到 {start_sec:.2f}s - {end_sec:.2f}s，正在重算...",
             foreground="purple",
         )
         self.refresh_plots()
@@ -3203,10 +3557,15 @@ class BreathReducerApp:
         edit_range = (float(start_sec), float(end_sec))
         if self.range_edit_mode == "add":
             self.manual_segments = _merge_time_ranges(self.manual_segments + [edit_range], min_gap_sec=0.002)
-            self._rebuild_effective_segments(rewrite_output=True)
+            self.segments_dirty = True
+            self._rebuild_effective_segments(
+                rewrite_output=True,
+                async_rewrite=True,
+                status_on_done=f"状态：已手动补充处理区间 {start_sec:.2f}s - {end_sec:.2f}s，并已立即生效",
+            )
             self.range_edit_mode = None
             self.status_label.config(
-                text=f"状态：已手动补充处理区间 {start_sec:.2f}s - {end_sec:.2f}s，并已立即生效",
+                text=f"状态：已手动补充处理区间 {start_sec:.2f}s - {end_sec:.2f}s，正在重算...",
                 foreground="purple",
             )
         elif self.range_edit_mode == "remove":
@@ -3226,14 +3585,15 @@ class BreathReducerApp:
                 item for item in effective_ranges
                 if not (abs(item[0] - removed_start) < 1e-6 and abs(item[1] - removed_end) < 1e-6)
             ]
-            self.half_time_ranges = [
-                item for item in self.half_time_ranges
-                if not (abs(item[0] - removed_start) <= 0.002 and abs(item[1] - removed_end) <= 0.002)
-            ]
-            self._replace_effective_segments(effective_ranges)
+            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(removed_start, removed_end)])
+            self.segments_dirty = True
+            self._replace_effective_segments(
+                effective_ranges,
+                status_on_done=f"状态：已取消处理区间 {removed_start:.2f}s - {removed_end:.2f}s，后续仍可重新手动选择这里",
+            )
             self.range_edit_mode = None
             self.status_label.config(
-                text=f"状态：已取消处理区间 {removed_start:.2f}s - {removed_end:.2f}s，后续仍可重新手动选择这里",
+                text=f"状态：已取消处理区间 {removed_start:.2f}s - {removed_end:.2f}s，正在重算...",
                 foreground="red",
             )
         self._update_selection_buttons()
@@ -3256,6 +3616,13 @@ class BreathReducerApp:
         self.is_paused = False
         if self.player_process and self.player_process.poll() is None:
             self.player_process.terminate()
+            try:
+                self.player_process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.player_process.kill()
+                except Exception:
+                    pass
         self.player_process = None
         if self.playback_temp_path and os.path.exists(self.playback_temp_path):
             try:
@@ -3271,6 +3638,13 @@ class BreathReducerApp:
             self.playback_job = None
         if self.player_process and self.player_process.poll() is None:
             self.player_process.terminate()
+            try:
+                self.player_process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.player_process.kill()
+                except Exception:
+                    pass
         self.player_process = None
         if self.playback_temp_path and os.path.exists(self.playback_temp_path):
             try:
@@ -3284,8 +3658,10 @@ class BreathReducerApp:
         self.is_paused = False
         self._update_play_toggle_buttons()
 
-    def _play_file(self, path):
+    def _play_file(self, path, owns_temp=False):
         self._stop_player()
+        if owns_temp:
+            self.playback_temp_path = path
         self.player_process = subprocess.Popen(["afplay", path])
         self._update_play_toggle_buttons()
 
@@ -3413,6 +3789,13 @@ class BreathReducerApp:
     def _pause_active_playback(self):
         if self.player_process and self.player_process.poll() is None:
             self.player_process.terminate()
+            try:
+                self.player_process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self.player_process.kill()
+                except Exception:
+                    pass
         self.player_process = None
         self.is_paused = True
         self._update_play_toggle_buttons()
@@ -3428,6 +3811,8 @@ class BreathReducerApp:
         self.play_active_output_btn.config(text=output_text)
 
     def toggle_active_playback(self, processed):
+        if self.is_busy:
+            return
         target = "output" if processed else "source"
         if self.playback_plot_kind == target and self.playback_start_audio_time is not None:
             if self.is_paused:
@@ -3470,7 +3855,7 @@ class BreathReducerApp:
         temp_audio = tempfile.NamedTemporaryFile(prefix="breath_clip_", suffix=".wav", delete=False)
         temp_audio.close()
         sf.write(temp_audio.name, clip, self.sr)
-        self._play_file(temp_audio.name)
+        self._play_file(temp_audio.name, owns_temp=True)
 
 
 if __name__ == "__main__":

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+*.log
+.run/
+.voice_memos_sync_state.json
+*.corrupt-*
