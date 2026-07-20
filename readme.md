@@ -90,4 +90,4 @@ $VOICE_MEMOS_TARGET_DIR  或  /Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹�
 .venv/bin/python test_regressions.py
 ```
 
-`test_regressions.py` 覆盖：重叠渲染长度、半速（精确/模糊/邻接合并）、目标文件名清洗、路径穿越、缺失源不误删、冲突进回收站。
+`test_regressions.py` 覆盖：重叠渲染长度、半速（精确/模糊/邻接合并/resize 比例映射）、目标文件名清洗与碰撞消歧、路径穿越、缺失源不误删、冲突进回收站、mono 缓冲共享、twin 清理。

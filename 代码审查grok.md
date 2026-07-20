@@ -1,32 +1,36 @@
 # 代码审查报告（Grok · v60 high）
 
 **审查日期**：2026-07-20  
-**审查对象**：`6af53e2` 起至 **v61** 修复后 · `VERSION = 61`  
+**审查对象**：持续演进至 **v62** · 当前 `VERSION = 62`  
 **范围**：`breath_reduce_mac.py`、`sync_voice_memos.py`、`test_regressions.py` 等  
-**方法**：high effort 多角度扫描 + 对抗验证；`test_regressions.py` **12/12** 通过  
+**方法**：high effort 多角度扫描 + 对抗验证；`test_regressions.py` **14/14** 通过  
 
 ---
 
 ## 执行摘要
 
-v60–v61 相对 v57 已修好：重叠渲染、半速邻接合并、主线程阻塞、同步裸删/缺失源误 trash、目标名嵌套、统一 `op_token`、busy 门禁，以及 v61 追加的：
+### 审查复核（相对 v60 报告）
 
-- 选文件失败 **回滚路径** + `loaded_input_path` 与导出一致性  
-- resize **比例映射半速**（不扩大局部半速）  
-- `after(10)` resize **绑定 op_token + busy**  
-- process/rewrite/export token 失配时 **`_release_busy_if_token`**  
-- sync `prev_name` rename **所有权校验**  
+| v60 报告主张 | v61/v62 状态 |
+|--------------|--------------|
+| 选文件失败路径/缓冲不同步 | **已修**（`loaded_input_path` + 失败回滚 + 导出一致性） |
+| resize 扩大局部半速 | **已修**（`_map_half_time_on_resize` 比例映射） |
+| `after(10)` resize 无 token | **已修**（`captured_token` + busy 检查） |
+| export token 失配不清理 busy | **已修**（`_release_busy_if_token`） |
+| sync prev_name 抢文件 | **已修**（`owns_prev_name` + other_owners） |
+| UI 整段紫 / 音频子段半速 | **有意 UX**，非正确性 bug |
+| 双遍 render / mono copy | **v62 已优化**：mono 共享缓冲 + 同缓冲单次 finalize/render |
+| async 三处复制 | **v62**：rewrite 已走 `_run_bg_job` |
+| twin 清理复制 | **v62**：`cleanup_name_twins` + `same_recording` 复用 |
 
-**当前无 Critical / 无开放 High 正确性项。**  
-
-「UI 整段紫色 / 音频子段半速」为 **有意粗粒度着色**。其余开放项多为效率与可维护性。
+**当前无 Critical / 无开放 High 正确性项。** 剩余主要是体验与进一步拆模块。
 
 | 级别 | 数量 |
 |------|------|
 | Critical | 0 |
-| High（正确性） | 0（P0 已修） |
-| Medium | 1（效率） |
-| Low / 清理 | 4+ |
+| High（正确性） | 0 |
+| Medium | 少量效率/架构债 |
+| Low / 清理 | 若干 |
 
 ---
 

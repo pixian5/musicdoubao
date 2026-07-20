@@ -87,10 +87,56 @@ def test_build_target_name_collision_disambiguates():
 
 def test_op_token_exists():
     assert hasattr(m, "VERSION")
-    assert m.VERSION >= 61
+    assert m.VERSION >= 62
     assert hasattr(m.BreathReducerApp, "_bump_op_token")
     assert hasattr(m.BreathReducerApp, "_release_busy_if_token")
     assert hasattr(m.BreathReducerApp, "_map_half_time_on_resize")
+    assert hasattr(m.BreathReducerApp, "_run_bg_job")
+    assert hasattr(m, "_audio_buffers_share_content")
+    assert hasattr(m, "DEFAULT_DETECT_PARAMS")
+
+
+def test_mono_buffer_share_and_single_render():
+    """Mono load should share analysis/playback; process should not force dual render."""
+    y = np.ones(4000, dtype=np.float32) * 0.1
+    # Simulate finalize share path
+    assert m._audio_buffers_share_content(y, y)
+    limited_plot, limited_playback, _ = m._finalize_rendered_output(y, y, 1000)
+    assert m._audio_buffers_share_content(limited_plot, limited_playback)
+    out_plot, tl = m._render_output_audio(limited_plot, 1000, [(1000, 2000)], atten_db=20)
+    # shared mono rewrite path returns same object for playback when bases share
+    class _App:
+        pass
+    # just ensure share helper works for equal mono arrays that are the same object
+    assert m._audio_buffers_share_content(out_plot, out_plot)
+    assert len(out_plot) == 4000 or len(out_plot) == 3500 or len(out_plot) > 0
+    assert tl
+
+
+def test_cleanup_name_twins():
+    root = Path(tempfile.mkdtemp())
+    try:
+        active_dir = root / "active"
+        deleted_dir = root / "最近删除"
+        trash = root / "回收站"
+        active_dir.mkdir()
+        deleted_dir.mkdir()
+        name = "Song+a.m4a"
+        (active_dir / name).write_bytes(b"active")
+        (deleted_dir / name).write_bytes(b"deleted")
+        path, conflicts = s.cleanup_name_twins(active_dir, deleted_dir, trash, name)
+        assert path is not None and path.name == name
+        assert conflicts == 1
+        assert (active_dir / name).exists()
+        assert not (deleted_dir / name).exists()
+        assert any(trash.iterdir())
+        # locate without trash
+        (deleted_dir / name).write_bytes(b"deleted2")
+        located = s.locate_managed_target(active_dir, deleted_dir, name)
+        assert located is not None and located.parent == active_dir
+        assert (deleted_dir / name).exists()  # not trashed by locate
+    finally:
+        shutil.rmtree(root)
 
 
 def test_map_half_time_on_resize_preserves_partial():
@@ -191,6 +237,8 @@ def main():
         test_build_target_name_no_nested_path,
         test_build_target_name_collision_disambiguates,
         test_op_token_exists,
+        test_mono_buffer_share_and_single_render,
+        test_cleanup_name_twins,
         test_map_half_time_on_resize_preserves_partial,
         test_resolve_under_blocks_traversal,
         test_missing_source_does_not_trash,

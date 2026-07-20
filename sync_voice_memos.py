@@ -287,10 +287,6 @@ def find_compat_existing_file(
     expected_prefix = sanitize_title(title)
     source_stem = Path(source_name).stem
     date_hint = source_stem.split()[0] if source_stem else ""
-    source_id = file_identity(source_path)
-    if source_id is None:
-        return None
-    source_size, source_mtime = source_id
     for candidate in target_dir.glob("*.m4a"):
         if not candidate.is_file() or not is_m4a_name(candidate.name):
             continue
@@ -300,16 +296,59 @@ def find_compat_existing_file(
             continue
         if date_hint and date_hint not in candidate.stem:
             continue
-        cand_id = file_identity(candidate)
-        if cand_id is None:
-            continue
-        cand_size, cand_mtime = cand_id
-        if cand_size != source_size:
-            continue
-        if abs(cand_mtime - source_mtime) > MTIME_TOLERANCE_SEC:
+        if not same_recording(source_path, candidate):
             continue
         return candidate
     return None
+
+
+def cleanup_name_twins(
+    target_dir: Path,
+    recently_deleted_dir: Path,
+    trash_dir: Path,
+    target_name: str,
+    *,
+    trash_deleted_twin: bool = True,
+) -> tuple[Path | None, int]:
+    """
+    Prefer active folder over 最近删除 when both exist.
+    Returns (preferred_path_or_None, conflicts_added).
+    """
+    if not target_name or not is_m4a_name(target_name):
+        return None, 0
+    active = target_dir / target_name
+    deleted = recently_deleted_dir / target_name
+    conflicts = 0
+    if active.exists() and deleted.exists():
+        try:
+            same = active.resolve() == deleted.resolve()
+        except OSError:
+            same = False
+        if not same and trash_deleted_twin:
+            move_to_trash(deleted, trash_dir)
+            conflicts = 1
+        return active, conflicts
+    if active.exists():
+        return active, 0
+    if deleted.exists():
+        return deleted, 0
+    return None, 0
+
+
+def locate_managed_target(
+    target_dir: Path,
+    recently_deleted_dir: Path,
+    target_name: str,
+) -> Path | None:
+    """Prefer active folder over 最近删除 when both exist (read-only locate)."""
+    path, _ = cleanup_name_twins(
+        target_dir,
+        recently_deleted_dir,
+        target_dir / DEFAULT_TRASH_DIR_NAME,
+        target_name,
+        trash_deleted_twin=False,
+    )
+    return path
 
 
 def normalize_state_items(raw_state_items: dict) -> dict[str, dict]:
@@ -412,26 +451,6 @@ def lookup_prev_state(
     return prev or {}
 
 
-def locate_managed_target(
-    target_dir: Path,
-    recently_deleted_dir: Path,
-    target_name: str,
-) -> Path | None:
-    """Prefer active folder over 最近删除 when both exist (avoid orphaning)."""
-    if not target_name or not is_m4a_name(target_name):
-        return None
-    active = target_dir / target_name
-    deleted = recently_deleted_dir / target_name
-    if active.exists():
-        if deleted.exists() and active.resolve() != deleted.resolve():
-            # Keep active; drop the stale deleted twin into a conflict name via trash later if needed.
-            pass
-        return active
-    if deleted.exists():
-        return deleted
-    return None
-
-
 def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path: Path) -> dict:
     target_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(state_path)
@@ -516,14 +535,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
             )
         )
         if owns_prev_name:
-            prev_path = locate_managed_target(target_dir, recently_deleted_dir, str(prev_name))
-            # If both folders had the same name, remove the stale twin after preferring active.
-            twin_active = target_dir / prev_name
-            twin_deleted = recently_deleted_dir / prev_name
-            if twin_active.exists() and twin_deleted.exists() and twin_active.resolve() != twin_deleted.resolve():
-                move_to_trash(twin_deleted, trash_dir)
-                conflicts += 1
-                prev_path = twin_active
+            prev_path, twin_conflicts = cleanup_name_twins(
+                target_dir, recently_deleted_dir, trash_dir, str(prev_name)
+            )
+            conflicts += twin_conflicts
 
             if prev_path and (prev_name != target_name or prev_path != target_path):
                 # Extra safety: if another live state entry still points at prev_name,
@@ -548,14 +563,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
 
         if not prev_name and not target_path.exists():
             legacy_name = legacy_name_map.get(source_name)
-            legacy_path = target_dir / legacy_name if legacy_name else None
-            legacy_deleted_path = recently_deleted_dir / legacy_name if legacy_name else None
             compat_path = None
-            if legacy_path and legacy_path.exists():
-                compat_path = legacy_path
-            elif legacy_deleted_path and legacy_deleted_path.exists():
-                compat_path = legacy_deleted_path
-            else:
+            if legacy_name:
+                compat_path = locate_managed_target(target_dir, recently_deleted_dir, legacy_name)
+            if compat_path is None:
                 compat_path = find_compat_existing_file(
                     target_dir,
                     title,
@@ -638,14 +649,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         # Do not trash a file still claimed by a live record this run.
         if target_name in claimed_existing_names:
             continue
-        target_path = locate_managed_target(target_dir, recently_deleted_dir, target_name)
-        # Clean up orphan twin if both exist.
-        twin_active = target_dir / target_name
-        twin_deleted = recently_deleted_dir / target_name
-        if twin_active.exists() and twin_deleted.exists() and twin_active.resolve() != twin_deleted.resolve():
-            move_to_trash(twin_deleted, trash_dir)
-            conflicts += 1
-            target_path = twin_active
+        target_path, twin_conflicts = cleanup_name_twins(
+            target_dir, recently_deleted_dir, trash_dir, target_name
+        )
+        conflicts += twin_conflicts
 
         if target_path:
             if move_to_trash(target_path, trash_dir) is not None:
@@ -656,11 +663,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         target_name = str(item.get("target_name") or "")
         if not is_m4a_name(target_name):
             continue
-        twin_active = target_dir / target_name
-        twin_deleted = recently_deleted_dir / target_name
-        if twin_active.exists() and twin_deleted.exists() and twin_active.resolve() != twin_deleted.resolve():
-            move_to_trash(twin_deleted, trash_dir)
-            conflicts += 1
+        _, twin_conflicts = cleanup_name_twins(
+            target_dir, recently_deleted_dir, trash_dir, target_name
+        )
+        conflicts += twin_conflicts
 
     state["items"] = next_state_items
     state["last_run_epoch"] = int(time.time())

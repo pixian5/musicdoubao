@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 61
+VERSION = 62
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -25,6 +25,21 @@ PLAYHEAD_DRAW_INTERVAL_MS = 120
 HALF_TIME_MATCH_TOLERANCE_SEC = 0.002
 LIMITER_CONTROL_RATE_HZ = 4000.0
 APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
+
+
+# Lightweight detection/export params (serializable to config.json).
+# Kept as a plain dict-friendly structure so GUI can still store flat keys.
+DEFAULT_DETECT_PARAMS = {
+    "atten_db": 30,
+    "sensitivity": 10,
+    "export_bitrate_kbps": 128,
+    "peak_reject": 3.0,
+    "percentile_reject": 20.0,
+    "voice_floor": 2.0,
+    "left_append_ms": LEFT_APPEND_MS,
+    "right_append_ms": RIGHT_APPEND_MS,
+    "min_segment_length_ms": 0.0,
+}
 
 # ── 事件日志开关：设为 True 后每次鼠标事件都写到 ~/breath_event_log.txt ──
 EVENT_LOG_ENABLED = False
@@ -48,16 +63,7 @@ rcParams["axes.unicode_minus"] = False
 
 
 def _load_app_config():
-    defaults = {
-        "atten_db": 30,
-        "sensitivity": 10,
-        "export_bitrate_kbps": 128,
-        "peak_reject": 3.0,
-        "percentile_reject": 20.0,
-        "voice_floor": 2.0,
-        "left_append_ms": LEFT_APPEND_MS,
-        "right_append_ms": RIGHT_APPEND_MS,
-    }
+    defaults = dict(DEFAULT_DETECT_PARAMS)
     try:
         if APP_CONFIG_PATH.exists():
             with APP_CONFIG_PATH.open("r", encoding="utf-8") as fh:
@@ -1678,8 +1684,9 @@ def _load_audio_for_processing(input_path):
             os.remove(temp_wav.name)
     y_full = np.asarray(y_full, dtype=np.float32)
     if y_full.ndim == 1:
+        # Mono: share one buffer for analysis and playback (no forced copy).
         playback_audio = y_full
-        analysis_audio = y_full.copy()
+        analysis_audio = y_full
     else:
         playback_audio = np.asarray(y_full, dtype=np.float32)
         analysis_audio = np.asarray(librosa.to_mono(y_full.T), dtype=np.float32)
@@ -1833,19 +1840,21 @@ def _compute_loud_phrase_taming_gain(audio, sr):
     }
 
 
-def _apply_sample_gain_curve(audio, gain_curve):
+def _apply_sample_gain_curve(audio, gain_curve, *, in_place=False):
     audio = np.asarray(audio, dtype=np.float32)
     gain_curve = np.asarray(gain_curve, dtype=np.float32)
     if audio.size == 0 or gain_curve.size == 0:
         return audio.astype(np.float32)
     usable = min(len(audio), len(gain_curve))
-    if audio.ndim == 1:
+    if in_place:
+        adjusted = audio
+    else:
         adjusted = audio.copy()
+    if adjusted.ndim == 1:
         adjusted[:usable] *= gain_curve[:usable]
-        return adjusted.astype(np.float32)
-    adjusted = audio.copy()
-    adjusted[:usable] *= gain_curve[:usable, None]
-    return adjusted.astype(np.float32)
+    else:
+        adjusted[:usable] *= gain_curve[:usable, None]
+    return adjusted.astype(np.float32, copy=False)
 
 
 def _load_actual_output_audio(output_path):
@@ -1853,17 +1862,46 @@ def _load_actual_output_audio(output_path):
     return np.asarray(analysis_audio, dtype=np.float32), np.asarray(playback_audio, dtype=np.float32)
 
 
+def _audio_buffers_share_content(a, b):
+    """True when plot/playback can share one limited/render result (mono shared buffer)."""
+    if a is b:
+        return True
+    a = np.asarray(a)
+    b = np.asarray(b)
+    if a.shape != b.shape or a.ndim != 1 or b.ndim != 1:
+        return False
+    # Same underlying memory or exact object content for mono.
+    return a.__array_interface__["data"][0] == b.__array_interface__["data"][0]
+
+
 def _finalize_rendered_output(output_plot_audio, output_playback_audio, sr):
     output_plot_audio = np.asarray(output_plot_audio, dtype=np.float32)
     output_playback_audio = np.asarray(output_playback_audio, dtype=np.float32)
+    share = _audio_buffers_share_content(output_plot_audio, output_playback_audio)
+
     loud_taming_gain, _ = _compute_loud_phrase_taming_gain(output_playback_audio, sr)
     output_playback_audio = _apply_sample_gain_curve(output_playback_audio, loud_taming_gain)
-    output_plot_audio = _apply_sample_gain_curve(output_plot_audio, loud_taming_gain)
+    if share:
+        output_plot_audio = output_playback_audio
+    else:
+        output_plot_audio = _apply_sample_gain_curve(output_plot_audio, loud_taming_gain)
+
     output_playback_audio, output_headroom_gain = _apply_output_headroom(output_playback_audio)
-    output_plot_audio = (output_plot_audio * output_headroom_gain).astype(np.float32)
+    if share:
+        output_plot_audio = output_playback_audio
+    else:
+        output_plot_audio = (output_plot_audio * output_headroom_gain).astype(np.float32)
+
     output_playback_audio = _apply_hot_peak_limiter(output_playback_audio, sr)
-    output_plot_audio = _apply_hot_peak_limiter(output_plot_audio, sr)
-    return output_plot_audio.astype(np.float32), output_playback_audio.astype(np.float32), float(output_headroom_gain)
+    if share:
+        output_plot_audio = output_playback_audio
+    else:
+        output_plot_audio = _apply_hot_peak_limiter(output_plot_audio, sr)
+    return (
+        np.asarray(output_plot_audio, dtype=np.float32),
+        np.asarray(output_playback_audio, dtype=np.float32),
+        float(output_headroom_gain),
+    )
 
 
 def process_breath(
@@ -1906,12 +1944,16 @@ def process_breath(
             breath_segments,
             atten_db=atten_db,
         )
-        y_processed_playback, _ = _render_output_audio(
-            limited_playback,
-            sr,
-            breath_segments,
-            atten_db=atten_db,
-        )
+        # Mono (shared limited buffers): one render is enough for plot + playback.
+        if _audio_buffers_share_content(limited_plot, limited_playback):
+            y_processed_playback = y_processed_plot
+        else:
+            y_processed_playback, _ = _render_output_audio(
+                limited_playback,
+                sr,
+                breath_segments,
+                atten_db=atten_db,
+            )
         output_path = _build_output_path(input_path)
 
         return {
@@ -3228,18 +3270,55 @@ class BreathReducerApp:
             atten_db=atten_db,
             half_time_segments=half_time_segments,
         )
-        output_playback, _ = _render_output_audio(
-            base_playback,
-            sr,
-            segments,
-            atten_db=atten_db,
-            half_time_segments=half_time_segments,
-        )
+        if _audio_buffers_share_content(base_source, base_playback):
+            output_playback = output_audio
+        else:
+            output_playback, _ = _render_output_audio(
+                base_playback,
+                sr,
+                segments,
+                atten_db=atten_db,
+                half_time_segments=half_time_segments,
+            )
         return {
             "output_audio": output_audio,
             "output_playback_audio": output_playback,
             "output_timeline_segments": timeline,
         }
+
+    def _run_bg_job(self, work_fn, on_success, on_error=None, busy_text="状态：处理中...", busy_color="orange"):
+        """Run work_fn in a daemon thread; apply result on UI thread with op_token/busy ownership."""
+        token = self._bump_op_token()
+        self._set_busy(True, busy_text, busy_color, busy_token=token)
+
+        def worker():
+            try:
+                result = work_fn()
+                error = None
+            except Exception as exc:
+                result = None
+                error = exc
+
+            def apply():
+                if token != self.op_token:
+                    self._release_busy_if_token(token)
+                    return
+                if error is not None:
+                    self._release_busy_if_token(token, "状态：处理失败", "red")
+                    if on_error is not None:
+                        on_error(error)
+                    else:
+                        messagebox.showerror("错误", str(error))
+                    return
+                on_success(result, token)
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+        return token
 
     def _rewrite_output_from_current_segments(self, async_mode=False, status_on_done=None):
         if self.source_audio is None or self.sr is None:
@@ -3268,46 +3347,29 @@ class BreathReducerApp:
             self.output_has_post_processing = True
             return
 
-        token = self._bump_op_token()
-        self._set_busy(True, "状态：正在重算输出，请稍候...", "orange", busy_token=token)
+        def work():
+            return self._compute_rewrite_outputs(
+                segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len
+            )
 
-        def worker():
-            try:
-                result = self._compute_rewrite_outputs(
-                    segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len
-                )
-                error = None
-            except Exception as exc:
-                result = None
-                error = exc
+        def on_ok(result, token):
+            if result is None:
+                self._release_busy_if_token(token)
+                return
+            self.output_audio = result["output_audio"]
+            self.output_playback_audio = result["output_playback_audio"]
+            self.output_timeline_segments = result["output_timeline_segments"]
+            self.output_display_audio = self.output_audio
+            self.output_has_post_processing = True
+            done_text = status_on_done or "状态：输出已更新"
+            self._release_busy_if_token(token, done_text, "blue")
+            self._update_selection_buttons()
+            self.refresh_plots()
 
-            def apply():
-                if token != self.op_token:
-                    self._release_busy_if_token(token)
-                    return
-                if error is not None:
-                    self._release_busy_if_token(token, "状态：重算失败", "red")
-                    messagebox.showerror("错误", str(error))
-                    return
-                if result is None:
-                    self._release_busy_if_token(token)
-                    return
-                self.output_audio = result["output_audio"]
-                self.output_playback_audio = result["output_playback_audio"]
-                self.output_timeline_segments = result["output_timeline_segments"]
-                self.output_display_audio = self.output_audio
-                self.output_has_post_processing = True
-                done_text = status_on_done or "状态：输出已更新"
-                self._release_busy_if_token(token, done_text, "blue")
-                self._update_selection_buttons()
-                self.refresh_plots()
+        def on_err(error):
+            messagebox.showerror("错误", str(error))
 
-            try:
-                self.root.after(0, apply)
-            except tk.TclError:
-                pass
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_bg_job(work, on_ok, on_error=on_err, busy_text="状态：正在重算输出，请稍候...")
 
     def _schedule_actual_output_refresh(self, output_file, parent_token=None):
         # Prefer parent export token so we do not invent a new generation while idle.
