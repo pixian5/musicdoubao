@@ -23,7 +23,17 @@ else
   exit 1
 fi
 
-"$PYI" --noconfirm --windowed --name "吸气声弱化工具" --clean breath_reduce_mac.py
+"$PYI" --noconfirm --windowed --name "吸气声弱化工具" --clean \
+  --collect-all breath \
+  --hidden-import breath \
+  --hidden-import breath.detect \
+  --hidden-import breath.render \
+  --hidden-import breath.limit \
+  --hidden-import breath.io \
+  --hidden-import breath.config \
+  --hidden-import breath.constants \
+  --hidden-import breath.segments \
+  breath_reduce_mac.py
 
 echo "3. 启动 app（如有弹窗请关注系统提示）..."
 open dist/吸气声弱化工具.app

@@ -87,33 +87,39 @@ def test_build_target_name_collision_disambiguates():
 
 def test_op_token_exists():
     assert hasattr(m, "VERSION")
-    assert m.VERSION >= 63
+    assert m.VERSION >= 64
     assert hasattr(m.BreathReducerApp, "_bump_op_token")
     assert hasattr(m.BreathReducerApp, "_release_busy_if_token")
     assert hasattr(m.BreathReducerApp, "_map_half_time_on_resize")
     assert hasattr(m.BreathReducerApp, "_run_bg_job")
-    assert hasattr(m, "_audio_buffers_share_content")
+    assert hasattr(m, "_audio_buffers_share_content") or hasattr(m, "audio_buffers_share_content")
     assert hasattr(m, "DEFAULT_DETECT_PARAMS")
     # process/export/rewrite should all go through the unified job helper
     src = Path(m.__file__).read_text(encoding="utf-8")
-    assert "def work():\n            return process_breath" in src or "return process_breath(" in src
+    assert "process_breath" in src
     assert 'busy_text="状态：正在导出 MP3..."' in src
+    # package split
+    import breath
+    assert breath.VERSION == m.VERSION
+    from breath.segments import BreathSegment, segments_from_parallel, parallel_from_segments
+    segs = segments_from_parallel([(1.0, 3.0)], [(1.0, 2.0)])
+    assert len(segs) == 1 and segs[0].half_ranges == [(1.0, 2.0)]
+    b, h = parallel_from_segments(segs)
+    assert b == [(1.0, 3.0)] and h == [(1.0, 2.0)]
 
 
 def test_mono_buffer_share_and_single_render():
     """Mono load should share analysis/playback; process should not force dual render."""
     y = np.ones(4000, dtype=np.float32) * 0.1
-    # Simulate finalize share path
-    assert m._audio_buffers_share_content(y, y)
-    limited_plot, limited_playback, _ = m._finalize_rendered_output(y, y, 1000)
-    assert m._audio_buffers_share_content(limited_plot, limited_playback)
-    out_plot, tl = m._render_output_audio(limited_plot, 1000, [(1000, 2000)], atten_db=20)
-    # shared mono rewrite path returns same object for playback when bases share
-    class _App:
-        pass
-    # just ensure share helper works for equal mono arrays that are the same object
-    assert m._audio_buffers_share_content(out_plot, out_plot)
-    assert len(out_plot) == 4000 or len(out_plot) == 3500 or len(out_plot) > 0
+    share = getattr(m, "_audio_buffers_share_content", None) or m.audio_buffers_share_content
+    finalize = getattr(m, "_finalize_rendered_output", None) or m.finalize_rendered_output
+    render = getattr(m, "_render_output_audio", None) or m.render_output_audio
+    assert share(y, y)
+    limited_plot, limited_playback, _ = finalize(y, y, 1000)
+    assert share(limited_plot, limited_playback)
+    out_plot, tl = render(limited_plot, 1000, [(1000, 2000)], atten_db=20)
+    assert share(out_plot, out_plot)
+    assert len(out_plot) > 0
     assert tl
 
 

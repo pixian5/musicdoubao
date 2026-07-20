@@ -1,8 +1,8 @@
 # 代码审查报告（Grok · v60 high）
 
 **审查日期**：2026-07-20  
-**审查对象**：持续演进至 **v62** · 当前 `VERSION = 62`  
-**范围**：`breath_reduce_mac.py`、`sync_voice_memos.py`、`test_regressions.py` 等  
+**审查对象**：持续演进至 **v64** · 当前 `VERSION = 64`  
+**范围**：`breath/` 包 + `breath_reduce_mac.py` GUI、`sync_voice_memos.py`、`test_regressions.py`  
 **方法**：high effort 多角度扫描 + 对抗验证；`test_regressions.py` **14/14** 通过  
 
 ---

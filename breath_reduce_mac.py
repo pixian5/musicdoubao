@@ -1,6 +1,6 @@
-import json
+#!/usr/bin/env python3
+"""吸气声弱化工具 — GUI entrypoint (DSP lives in breath/)."""
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -15,1965 +15,57 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 63
-HOP_LENGTH = 512
-LEFT_APPEND_MS = 20.0
-RIGHT_APPEND_MS = 0.0
-MIN_MANUAL_DRAG_SEC = 0.03
-MIN_RESIZE_DRAG_SEC = 0.02
-PLAYHEAD_DRAW_INTERVAL_MS = 120
-HALF_TIME_MATCH_TOLERANCE_SEC = 0.002
-LIMITER_CONTROL_RATE_HZ = 4000.0
-APP_CONFIG_PATH = Path.home() / "Library" / "Application Support" / "musicdoubao" / "config.json"
+from breath import (
+    VERSION,
+    HOP_LENGTH,
+    LEFT_APPEND_MS,
+    RIGHT_APPEND_MS,
+    MIN_MANUAL_DRAG_SEC,
+    MIN_RESIZE_DRAG_SEC,
+    PLAYHEAD_DRAW_INTERVAL_MS,
+    HALF_TIME_MATCH_TOLERANCE_SEC,
+    DEFAULT_DETECT_PARAMS,
+    process_breath,
+    load_app_config,
+    save_app_config,
+    event_log,
+    format_diagnostics_text,
+    build_output_path,
+    write_output_mp3,
+    load_actual_output_audio,
+    render_output_audio,
+    merge_time_ranges,
+    subtract_time_ranges,
+    time_ranges_to_samples,
+    is_half_time_sample_segment,
+    half_time_overlaps_in_range,
+    split_segment_by_half_time,
+    audio_buffers_share_content,
+    finalize_rendered_output,
+    merge_sample_segments,
+)
 
-
-# Lightweight detection/export params (serializable to config.json).
-# Kept as a plain dict-friendly structure so GUI can still store flat keys.
-DEFAULT_DETECT_PARAMS = {
-    "atten_db": 30,
-    "sensitivity": 10,
-    "export_bitrate_kbps": 128,
-    "peak_reject": 3.0,
-    "percentile_reject": 20.0,
-    "voice_floor": 2.0,
-    "left_append_ms": LEFT_APPEND_MS,
-    "right_append_ms": RIGHT_APPEND_MS,
-    "min_segment_length_ms": 0.0,
-}
-
-# ── 事件日志开关：设为 True 后每次鼠标事件都写到 ~/breath_event_log.txt ──
-EVENT_LOG_ENABLED = False
-_EVENT_LOG_PATH = Path.home() / "breath_event_log.txt"
-
-
-def _event_log(msg: str) -> None:
-    """仅在 EVENT_LOG_ENABLED=True 时写日志，不影响性能。"""
-    if not EVENT_LOG_ENABLED:
-        return
-    import datetime
-    line = f"[{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}\n"
-    try:
-        with _EVENT_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-    except Exception:
-        pass
+# Backward-compatible private aliases (tests / older call sites).
+_render_output_audio = render_output_audio
+_finalize_rendered_output = finalize_rendered_output
+_audio_buffers_share_content = audio_buffers_share_content
+_merge_time_ranges = merge_time_ranges
+_subtract_time_ranges = subtract_time_ranges
+_time_ranges_to_samples = time_ranges_to_samples
+_is_half_time_sample_segment = is_half_time_sample_segment
+_half_time_overlaps_in_range = half_time_overlaps_in_range
+_split_segment_by_half_time = split_segment_by_half_time
+_merge_sample_segments = merge_sample_segments
+_load_app_config = load_app_config
+_save_app_config = save_app_config
+_event_log = event_log
+_format_diagnostics_text = format_diagnostics_text
+_build_output_path = build_output_path
+_write_output_mp3 = write_output_mp3
+_load_actual_output_audio = load_actual_output_audio
 
 rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "DejaVu Sans"]
 rcParams["axes.unicode_minus"] = False
-
-
-def _load_app_config():
-    defaults = dict(DEFAULT_DETECT_PARAMS)
-    try:
-        if APP_CONFIG_PATH.exists():
-            with APP_CONFIG_PATH.open("r", encoding="utf-8") as fh:
-                loaded = json.load(fh)
-            if isinstance(loaded, dict):
-                defaults.update(loaded)
-    except Exception:
-        pass
-    return defaults
-
-
-def _save_app_config(config):
-    try:
-        APP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with APP_CONFIG_PATH.open("w", encoding="utf-8") as fh:
-            json.dump(config, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _percentile_norm(values, low=5, high=95):
-    values = np.asarray(values, dtype=np.float32)
-    lo = float(np.percentile(values, low))
-    hi = float(np.percentile(values, high))
-    return np.clip((values - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-
-
-def _moving_average(values, window_size):
-    values = np.asarray(values, dtype=np.float32)
-    window_size = max(1, int(window_size))
-    if window_size == 1:
-        return values
-    kernel = np.ones(window_size, dtype=np.float32) / window_size
-    smoothed = np.convolve(values, kernel, mode="same")
-    if len(smoothed) == len(values):
-        return smoothed
-    if len(smoothed) < len(values):
-        padded = np.zeros_like(values)
-        padded[: len(smoothed)] = smoothed
-        return padded
-    extra = len(smoothed) - len(values)
-    start = extra // 2
-    end = start + len(values)
-    return smoothed[start:end]
-
-
-def _close_mask(mask, gap_tolerance):
-    mask = np.asarray(mask, dtype=bool)
-    if gap_tolerance <= 0 or mask.size == 0:
-        return mask
-
-    closed = mask.copy()
-    false_run_start = None
-    for idx, value in enumerate(mask):
-        if not value and false_run_start is None:
-            false_run_start = idx
-        elif value and false_run_start is not None:
-            if idx - false_run_start <= gap_tolerance:
-                closed[false_run_start:idx] = True
-            false_run_start = None
-    return closed
-
-
-def _merge_segments(mask, frame_time, sr, min_duration=0.09, max_duration=0.60):
-    segments = []
-    active = np.flatnonzero(mask)
-    if len(active) == 0:
-        return segments
-
-    start_frame = active[0]
-    prev_frame = active[0]
-
-    for frame in active[1:]:
-        if frame - prev_frame <= 2:
-            prev_frame = frame
-            continue
-
-        start = int(start_frame * frame_time * sr)
-        end = int((prev_frame + 1) * frame_time * sr)
-        duration = (end - start) / sr
-        if min_duration <= duration <= max_duration:
-            segments.append((start, end))
-
-        start_frame = frame
-        prev_frame = frame
-
-    start = int(start_frame * frame_time * sr)
-    end = int((prev_frame + 1) * frame_time * sr)
-    duration = (end - start) / sr
-    if min_duration <= duration <= max_duration:
-        segments.append((start, end))
-    return segments
-
-
-def _sample_slice(values, start_frame, end_frame):
-    start_frame = max(0, start_frame)
-    end_frame = min(len(values), end_frame)
-    if end_frame <= start_frame:
-        return np.asarray([], dtype=np.float32)
-    return np.asarray(values[start_frame:end_frame], dtype=np.float32)
-
-
-def _linear_slope(values):
-    values = np.asarray(values, dtype=np.float32)
-    if len(values) < 2:
-        return 0.0
-    x = np.arange(len(values), dtype=np.float32)
-    x = x - np.mean(x)
-    y = values - np.mean(values)
-    denom = float(np.sum(x * x)) + 1e-6
-    return float(np.sum(x * y) / denom)
-
-
-def _merge_nearby_segments(segments, sr, max_gap=0.10, max_duration=0.45):
-    if not segments:
-        return []
-
-    merged = [dict(segments[0])]
-    max_gap_samples = int(max_gap * sr)
-    max_duration_samples = int(max_duration * sr)
-
-    for item in segments[1:]:
-        prev = merged[-1]
-        gap = item["start"] - prev["end"]
-        combined_duration = item["end"] - prev["start"]
-        if gap <= max_gap_samples and combined_duration <= max_duration_samples:
-            prev["end"] = item["end"]
-            prev["duration"] = (prev["end"] - prev["start"]) / sr
-            prev["mean_score"] = max(prev["mean_score"], item["mean_score"])
-            prev["peak_score"] = max(prev["peak_score"], item["peak_score"])
-            prev["mean_rms"] = min(prev["mean_rms"], item["mean_rms"])
-            prev["rise_ratio"] = max(prev["rise_ratio"], item["rise_ratio"])
-            prev["texture_score"] = max(prev["texture_score"], item["texture_score"])
-        else:
-            merged.append(dict(item))
-    return merged
-
-
-def _expand_segment_edges(segments, sr, frame_time, relaxed_threshold, energy_ceiling, smoothed_score, rms_norm, zcr_norm, centroid_norm):
-    if not segments:
-        return []
-
-    expanded = []
-    max_expand_frames = max(1, int(round(0.24 / frame_time)))
-    edge_threshold = max(0.11, relaxed_threshold - 0.10)
-    edge_energy_limit = min(energy_ceiling * 0.24, 0.13)
-
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = min(len(smoothed_score) - 1, int(np.ceil(end / HOP_LENGTH)))
-
-        new_start = start_frame
-        for _ in range(max_expand_frames):
-            probe = new_start - 1
-            if probe < 0:
-                break
-            if (
-                smoothed_score[probe] >= edge_threshold
-                or (
-                    rms_norm[probe] <= edge_energy_limit
-                    and zcr_norm[probe] >= 0.20
-                    and centroid_norm[probe] >= 0.19
-                )
-            ):
-                new_start = probe
-            else:
-                break
-
-        new_end = end_frame
-        for _ in range(max_expand_frames):
-            probe = new_end + 1
-            if probe >= len(smoothed_score):
-                break
-            if (
-                smoothed_score[probe] >= edge_threshold
-                or (
-                    rms_norm[probe] <= edge_energy_limit
-                    and zcr_norm[probe] >= 0.20
-                    and centroid_norm[probe] >= 0.19
-                )
-            ):
-                new_end = probe
-            else:
-                break
-
-        expanded.append((int(new_start * frame_time * sr), int((new_end + 1) * frame_time * sr)))
-
-    return expanded
-
-
-def _refine_segment_to_core(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm):
-    refined = []
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_rms = rms_norm[start_frame:end_frame]
-        seg_score = smoothed_score[start_frame:end_frame]
-        seg_zcr = zcr_norm[start_frame:end_frame]
-        seg_cent = centroid_norm[start_frame:end_frame]
-        if len(seg_rms) == 0:
-            continue
-
-        # 如果整段能量明显偏高，只保留其中更像吸气的低能量核心
-        if float(np.mean(seg_rms)) > 0.10:
-            core_mask = (
-                (seg_rms < min(float(np.mean(seg_rms)) * 0.55, 0.12))
-                & (seg_score > 0.20)
-                & (seg_zcr > 0.36)
-                & (seg_cent > 0.38)
-            )
-            core_segments = _merge_segments(core_mask, frame_time, sr, min_duration=0.06, max_duration=0.52)
-            if core_segments:
-                base = start_frame * frame_time * sr
-                for core_start, core_end in core_segments:
-                    refined.append((int(base + core_start), int(base + core_end)))
-                continue
-
-        refined.append((start, end))
-
-    return refined
-
-
-def _trim_segment_heads_tails(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm, bandwidth_norm):
-    trimmed = []
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_score = smoothed_score[start_frame:end_frame]
-        seg_rms = rms_norm[start_frame:end_frame]
-        seg_zcr = zcr_norm[start_frame:end_frame]
-        seg_cent = centroid_norm[start_frame:end_frame]
-        seg_bw = bandwidth_norm[start_frame:end_frame]
-        if len(seg_score) == 0:
-            continue
-
-        core_mask = _close_mask(
-            (seg_rms < 0.09)
-            & (
-                (seg_score > 0.25)
-                | ((seg_zcr > 0.47) & (seg_cent > 0.45) & (seg_bw > 0.44))
-            ),
-            2,
-        )
-        voice_mask = _close_mask(
-            (
-                ((seg_rms > 0.08) & (seg_score < 0.26) & (seg_zcr < 0.42))
-                | ((seg_rms > 0.10) & (seg_cent < 0.44) & (seg_bw < 0.45))
-                | ((seg_rms > 0.12) & (seg_score < 0.33))
-            ),
-            2,
-        )
-
-        active = np.flatnonzero(core_mask)
-        if len(active) == 0:
-            trimmed.append((start, end))
-            continue
-
-        runs = []
-        run_start = active[0]
-        prev = active[0]
-        for frame in active[1:]:
-            if frame - prev <= 2:
-                prev = frame
-                continue
-            runs.append((run_start, prev))
-            run_start = frame
-            prev = frame
-        runs.append((run_start, prev))
-
-        best_start, best_end = max(runs, key=lambda item: item[1] - item[0])
-
-        edge_window = max(2, int(round(0.045 / frame_time)))
-        edge_guard = max(1, int(round(0.020 / frame_time)))
-        left_voice = bool(np.count_nonzero(voice_mask[:edge_window]) >= max(2, edge_window // 2))
-        right_voice = bool(np.count_nonzero(voice_mask[-edge_window:]) >= max(2, edge_window // 2))
-
-        trim_start_frame = start_frame
-        trim_end_frame = end_frame - 1
-        if left_voice and best_start > edge_guard:
-            trim_start_frame = start_frame + max(0, best_start - edge_guard)
-        if right_voice and (len(seg_score) - 1 - best_end) > edge_guard:
-            trim_end_frame = start_frame + min(len(seg_score) - 1, best_end + edge_guard)
-
-        trimmed_start = int(trim_start_frame * frame_time * sr)
-        trimmed_end = int((trim_end_frame + 1) * frame_time * sr)
-        duration = (trimmed_end - trimmed_start) / sr
-        removed_ratio = 1.0 - (duration / max((end - start) / sr, 1e-6))
-        if 0.08 <= duration <= 0.65 and removed_ratio <= 0.60:
-            trimmed.append((trimmed_start, trimmed_end))
-        else:
-            trimmed.append((start, end))
-
-    return trimmed
-
-
-def _extend_breath_edges(segments, sr, frame_time, smoothed_score, rms_norm, zcr_norm, centroid_norm, bandwidth_norm):
-    extended = []
-    if not segments:
-        return extended
-
-    max_extend_frames = max(1, int(round(0.26 / frame_time)))
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-
-        new_start = start_frame
-        for _ in range(max_extend_frames):
-            probe = new_start - 1
-            if probe < 0:
-                break
-            if (
-                rms_norm[probe] <= 0.16
-                and smoothed_score[probe] >= 0.13
-                and zcr_norm[probe] >= 0.31
-                and centroid_norm[probe] >= 0.31
-            ):
-                new_start = probe
-            else:
-                break
-
-        new_end = end_frame - 1
-        for _ in range(max_extend_frames):
-            probe = new_end + 1
-            if probe >= len(smoothed_score):
-                break
-            if (
-                rms_norm[probe] <= 0.16
-                and smoothed_score[probe] >= 0.13
-                and zcr_norm[probe] >= 0.31
-                and centroid_norm[probe] >= 0.31
-            ):
-                new_end = probe
-            else:
-                break
-
-        extended.append((int(new_start * frame_time * sr), int((new_end + 1) * frame_time * sr)))
-    return extended
-
-
-def _trim_loud_edges_by_threshold(segments, sr, frame_time, raw_rms, peak_reject_threshold, percentile_reject_threshold):
-    trimmed = []
-    if not segments:
-        return trimmed
-
-    edge_window = max(1, int(round(0.035 / frame_time)))
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_raw = raw_rms[start_frame:end_frame]
-        if len(seg_raw) == 0:
-            continue
-
-        left = 0
-        right = len(seg_raw) - 1
-        while left <= right:
-            left_slice = seg_raw[left : min(len(seg_raw), left + edge_window)]
-            if (
-                seg_raw[left] > peak_reject_threshold + 1e-6
-                or float(np.max(left_slice)) > peak_reject_threshold + 1e-6
-                or float(np.percentile(left_slice, 80)) > percentile_reject_threshold + 1e-6
-            ):
-                left += 1
-                continue
-            break
-        while right >= left:
-            right_slice = seg_raw[max(0, right - edge_window + 1) : right + 1]
-            if (
-                seg_raw[right] > peak_reject_threshold + 1e-6
-                or float(np.max(right_slice)) > peak_reject_threshold + 1e-6
-                or float(np.percentile(right_slice, 80)) > percentile_reject_threshold + 1e-6
-            ):
-                right -= 1
-                continue
-            break
-
-        if right < left:
-            continue
-
-        new_start = start_frame + left
-        new_end = start_frame + right + 1
-        duration = (new_end - new_start) * frame_time
-        if duration < 0.035:
-            continue
-
-        remaining = raw_rms[new_start:new_end]
-        if len(remaining) == 0:
-            continue
-        if float(np.max(remaining)) > peak_reject_threshold + 1e-6:
-            continue
-        if float(np.percentile(remaining, 90)) > percentile_reject_threshold + 1e-6:
-            continue
-
-        trimmed.append((int(new_start * frame_time * sr), int(new_end * frame_time * sr)))
-    return trimmed
-
-
-def _trim_rising_voice_right_edges(segments, sr, frame_time, raw_rms, peak_reject_threshold, percentile_reject_threshold, voice_floor_threshold):
-    trimmed = []
-    if not segments:
-        return trimmed
-
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_raw = np.asarray(raw_rms[start_frame:end_frame], dtype=np.float32)
-        if len(seg_raw) < 5:
-            trimmed.append((start, end))
-            continue
-
-        smoothed = _moving_average(seg_raw, 3)
-        low_floor = float(np.percentile(smoothed, 20))
-        tail_start = max(1, len(smoothed) // 2)
-        trim_at = None
-
-        for idx in range(tail_start, len(smoothed) - 2):
-            current = float(smoothed[idx])
-            next_1 = float(smoothed[idx + 1])
-            next_2 = float(smoothed[idx + 2])
-            suffix_max = float(np.max(smoothed[idx:]))
-            voice_gate = max(
-                low_floor * 2.2,
-                voice_floor_threshold * 1.35 if voice_floor_threshold > 0 else 0.0,
-                percentile_reject_threshold * 0.58,
-                peak_reject_threshold * 0.48,
-                0.01,
-            )
-            suffix_gate = max(
-                low_floor * 3.0,
-                percentile_reject_threshold * 0.78,
-                peak_reject_threshold * 0.68,
-                voice_gate * 1.18,
-            )
-            if (
-                current >= voice_gate
-                and next_1 >= current * 1.04
-                and next_2 >= next_1 * 1.02
-                and suffix_max >= suffix_gate
-            ):
-                trim_at = idx
-                break
-
-        if trim_at is None:
-            trimmed.append((start, end))
-            continue
-
-        new_end_frame = start_frame + max(1, trim_at - 1)
-        new_end = int(new_end_frame * frame_time * sr)
-        if new_end - start >= int(0.04 * sr):
-            trimmed.append((start, new_end))
-        else:
-            trimmed.append((start, end))
-
-    return trimmed
-
-
-def _trim_following_voice_onset(segments, sr, frame_time, raw_rms, peak_reject_threshold, percentile_reject_threshold, voice_floor_threshold):
-    trimmed = []
-    if not segments:
-        return trimmed
-
-    look_ahead_frames = max(3, int(round(0.12 / frame_time)))
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_raw = np.asarray(raw_rms[start_frame:end_frame], dtype=np.float32)
-        follow_raw = np.asarray(raw_rms[end_frame : end_frame + look_ahead_frames], dtype=np.float32)
-        if len(seg_raw) < 4 or len(follow_raw) < 3:
-            trimmed.append((start, end))
-            continue
-
-        seg_smooth = _moving_average(seg_raw, 3)
-        follow_smooth = _moving_average(follow_raw, 3)
-        combined = np.concatenate(
-            (
-                seg_smooth[max(0, len(seg_smooth) - max(4, len(seg_smooth) // 3)) :],
-                follow_smooth,
-            )
-        )
-        seg_floor = float(np.percentile(seg_smooth, 25))
-        seg_tail = float(np.percentile(seg_smooth[max(0, len(seg_smooth) - max(2, len(seg_smooth) // 4)) :], 70))
-        voice_gate = max(
-            seg_floor * 1.75,
-            seg_tail * 1.08,
-            voice_floor_threshold * 1.30 if voice_floor_threshold > 0 else 0.0,
-            percentile_reject_threshold * 0.48,
-            peak_reject_threshold * 0.40,
-            0.010,
-        )
-
-        onset_idx = None
-        tail_offset = len(combined) - len(follow_smooth)
-        for idx in range(0, len(combined) - 2):
-            a = float(combined[idx])
-            b = float(combined[idx + 1])
-            c = float(combined[idx + 2])
-            if (
-                a >= voice_gate
-                and b >= a * 1.015
-                and c >= b * 1.01
-                and max(a, b, c) >= max(percentile_reject_threshold * 0.60, peak_reject_threshold * 0.50, voice_gate * 1.03)
-            ):
-                onset_idx = idx
-                break
-
-        if onset_idx is None:
-            trimmed.append((start, end))
-            continue
-
-        cut_in_seg = min(max(1, onset_idx), tail_offset)
-        low_cut_gate = max(seg_floor * 1.08, voice_floor_threshold * 1.02 if voice_floor_threshold > 0 else 0.0, 0.006)
-        back_cut = max(1, len(seg_smooth) - max(4, len(seg_smooth) // 3))
-        for idx in range(min(len(seg_smooth) - 1, cut_in_seg), max(0, cut_in_seg - 4) - 1, -1):
-            if float(seg_smooth[idx]) <= low_cut_gate:
-                back_cut = idx
-                break
-
-        new_end_frame = start_frame + max(1, back_cut)
-        new_end = int(new_end_frame * frame_time * sr)
-        if new_end - start >= int(0.04 * sr):
-            trimmed.append((start, new_end))
-        else:
-            trimmed.append((start, end))
-
-    return trimmed
-
-
-def _snap_right_edge_to_tail_valley(segments, sr, frame_time, raw_rms, peak_reject_threshold, voice_floor_threshold):
-    snapped = []
-    if not segments:
-        return snapped
-
-    look_ahead_frames = max(12, int(round(0.55 / frame_time)))
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = max(start_frame + 1, int(np.ceil(end / HOP_LENGTH)))
-        seg_raw = np.asarray(raw_rms[start_frame:end_frame], dtype=np.float32)
-        follow_raw = np.asarray(raw_rms[end_frame : end_frame + look_ahead_frames], dtype=np.float32)
-        if len(seg_raw) < 4 or len(follow_raw) < 3:
-            snapped.append((start, end))
-            continue
-
-        combined = np.concatenate((seg_raw, follow_raw))
-        if len(combined) < 5:
-            snapped.append((start, end))
-            continue
-
-        below_threshold = peak_reject_threshold + 1e-6
-        entry_idx = None
-        for idx in range(0, len(seg_raw) - 1):
-            if float(seg_raw[idx]) <= below_threshold and float(seg_raw[idx + 1]) <= max(below_threshold * 1.10, below_threshold + 0.002):
-                entry_idx = idx
-                break
-
-        if entry_idx is None:
-            snapped.append((start, end))
-            continue
-
-        crossing_idx = None
-        for idx in range(entry_idx + 1, len(combined)):
-            if float(combined[idx]) > below_threshold:
-                crossing_idx = idx
-                break
-
-        if crossing_idx is None:
-            snapped.append((start, end))
-            continue
-
-        search_start = max(entry_idx, crossing_idx - max(18, len(seg_raw) // 2))
-        search_end = max(search_start + 1, crossing_idx)
-        best_valley_idx = None
-        for idx in range(search_start, search_end):
-            cur = float(combined[idx])
-            prev = float(combined[idx - 1])
-            nxt = float(combined[idx + 1]) if idx + 1 < len(combined) else cur
-            if cur <= prev + 1e-6 and cur <= nxt + 1e-6 and cur <= peak_reject_threshold + 1e-6:
-                best_valley_idx = idx
-
-        if best_valley_idx is None:
-            for idx in range(search_end - 1, search_start - 1, -1):
-                cur = float(combined[idx])
-                prev = float(combined[idx - 1]) if idx - 1 >= 0 else cur
-                if cur <= prev + 1e-6 and cur <= peak_reject_threshold + 1e-6:
-                    best_valley_idx = idx
-                    break
-        if best_valley_idx is None:
-            window = combined[search_start:search_end]
-            best_valley_idx = search_start + int(np.argmin(window))
-
-        cut_idx = max(entry_idx, best_valley_idx)
-        new_end_frame = start_frame + cut_idx
-        new_end = int(new_end_frame * frame_time * sr)
-        if new_end - start >= int(0.04 * sr):
-            snapped.append((start, new_end))
-        else:
-            snapped.append((start, end))
-
-    return snapped
-
-
-def _detect_low_voice_silence_segments(raw_rms, frame_time, sr, voice_floor_threshold):
-    if voice_floor_threshold <= 0.0:
-        return []
-    silence_mask = _close_mask(
-        raw_rms <= voice_floor_threshold + 1e-6,
-        max(1, int(round(0.12 / frame_time))),
-    )
-    return _merge_segments(silence_mask, frame_time, sr, min_duration=0.08, max_duration=20.0)
-
-
-def _detect_breath_segments(y, sr, sensitivity, peak_reject_threshold=0.20, percentile_reject_threshold=0.20, voice_floor_threshold=0.0, min_segment_length_ms=0.0):
-    frame_time = HOP_LENGTH / sr
-    rms = librosa.feature.rms(y=y, hop_length=HOP_LENGTH)[0]
-    flatness = librosa.feature.spectral_flatness(y=y, hop_length=HOP_LENGTH)[0]
-    zcr = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
-    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
-    bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
-    raw_rms = np.asarray(rms, dtype=np.float32)
-
-    if raw_rms.size == 0:
-        diagnostics = {
-            "candidate_hits": 0,
-            "strict_hits": 0,
-            "relaxed_hits": 0,
-            "raw_segments": 0,
-            "kept_segments": 0,
-            "max_score": 0.0,
-            "mean_score": 0.0,
-            "avg_duration": 0.0,
-            "avg_rise_ratio": 0.0,
-            "smooth_frames": 0,
-            "strict_threshold": 0.0,
-        }
-        return [], diagnostics
-
-    rms_norm = _percentile_norm(rms)
-    flatness_norm = _percentile_norm(flatness)
-    zcr_norm = _percentile_norm(zcr)
-    centroid_norm = _percentile_norm(centroid)
-    bandwidth_norm = _percentile_norm(bandwidth)
-    global_voice_p75 = float(np.percentile(raw_rms, 75))
-    global_voice_p87 = float(np.percentile(raw_rms, 87))
-    global_noise_p35 = float(np.percentile(raw_rms, 35))
-    # 动态气息能量上限：即使用户把 peak_reject 调高，也不允许超过音轨整体响度的
-    # 一定比例，防止把歌唱段误判为气息。上限 = min(用户阈值, p75*0.62)，
-    # 但不低于 0.05（保证低响度音轨仍有足够空间）。
-    breath_rms_cap = float(np.clip(
-        min(peak_reject_threshold, global_voice_p75 * 0.62),
-        0.05, peak_reject_threshold,
-    ))
-
-    sensitivity = int(np.clip(sensitivity, 1, 10))
-    energy_ceiling = np.clip(0.52 + (10 - sensitivity) * 0.045, 0.50, 0.92)
-    energy_floor = np.clip(0.004 + (1 / max(sensitivity, 1)) * 0.01, 0.003, 0.02)
-    noise_floor = np.clip(0.30 - sensitivity * 0.017, 0.08, 0.28)
-
-    if len(rms_norm) > 4:
-        lead_rms = np.pad(rms_norm[4:], (0, 4), mode="edge")
-    else:
-        lead_rms = np.full_like(rms_norm, rms_norm[-1])
-    breath_score = (
-        0.30 * flatness_norm
-        + 0.22 * zcr_norm
-        + 0.18 * centroid_norm
-        + 0.15 * bandwidth_norm
-        + 0.15 * np.clip(lead_rms - rms_norm, 0.0, 1.0)
-    )
-    smooth_frames = max(3, int(round(0.12 / frame_time)))
-    smoothed_score = _moving_average(breath_score, smooth_frames)
-
-    candidate_mask = (
-        (rms_norm > energy_floor)
-        & (rms_norm < energy_ceiling)
-        & (
-            (flatness_norm > noise_floor)
-            | (zcr_norm > max(0.08, noise_floor - 0.02))
-            | (centroid_norm > max(0.08, noise_floor - 0.01))
-            | (bandwidth_norm > max(0.08, noise_floor - 0.01))
-        )
-    )
-    low_voice_frame_mask = (
-        voice_floor_threshold > 0.0
-    ) & (raw_rms <= voice_floor_threshold + 1e-6)
-    candidate_mask = candidate_mask | low_voice_frame_mask
-
-    strict_threshold = np.clip(0.55 - sensitivity * 0.028, 0.22, 0.50)
-    relaxed_threshold = np.clip(strict_threshold - 0.12, 0.14, 0.42)
-    strict_mask = (candidate_mask & (smoothed_score > strict_threshold)) | low_voice_frame_mask
-    relaxed_mask = (candidate_mask & (smoothed_score > relaxed_threshold)) | low_voice_frame_mask
-    post_phrase_mask = (
-        (smoothed_score > max(0.18, relaxed_threshold - 0.04))
-        & (rms_norm < 0.13)
-        & (zcr_norm > 0.40)
-        & (centroid_norm > 0.40)
-        & (bandwidth_norm > 0.42)
-        & (lead_rms > np.maximum(rms_norm * 1.35, 0.11))
-    )
-    low_energy_breath_mask = (
-        (smoothed_score > max(0.20, relaxed_threshold - 0.02))
-        & (rms_norm < 0.10)
-        & (flatness_norm > 0.07)
-        & (zcr_norm > 0.42)
-        & (centroid_norm > 0.41)
-        & (bandwidth_norm > 0.43)
-    )
-    rescue_mask = (
-        (smoothed_score > max(0.18, strict_threshold - 0.08))
-        & (rms_norm > energy_floor * 0.8)
-        & (rms_norm < min(energy_ceiling * 0.60, 0.20))
-        & (zcr_norm > 0.22)
-        & (centroid_norm > 0.22)
-    )
-    bright_breath_mask = (
-        (smoothed_score > max(0.26, strict_threshold))
-        & (rms_norm < 0.08)
-        & (zcr_norm > 0.50)
-        & (centroid_norm > 0.48)
-        & (bandwidth_norm > 0.45)
-    )
-    airy_breath_mask = (
-        (smoothed_score > max(0.21, strict_threshold - 0.05))
-        & (rms_norm < 0.09)
-        & (zcr_norm > 0.44)
-        & (centroid_norm > 0.45)
-        & (bandwidth_norm > 0.45)
-    )
-    micro_breath_mask = (
-        (smoothed_score > 0.24)
-        & (rms_norm < 0.085)
-        & (zcr_norm > 0.46)
-        & (centroid_norm > 0.45)
-        & (bandwidth_norm > 0.45)
-    )
-    short_breath_mask = (
-        (smoothed_score > max(0.20, strict_threshold - 0.06))
-        & (rms_norm > energy_floor * 0.7)
-        & (rms_norm < 0.11)
-        & (flatness_norm > 0.11)
-        & (zcr_norm > 0.43)
-        & (centroid_norm > 0.43)
-        & (bandwidth_norm > 0.42)
-    )
-    needle_breath_mask = (
-        (smoothed_score > max(0.30, strict_threshold + 0.02))
-        & (rms_norm < 0.08)
-        & (zcr_norm > 0.56)
-        & (centroid_norm > 0.52)
-        & (bandwidth_norm > 0.50)
-    )
-    core_breath_mask = (
-        (smoothed_score > max(0.23, strict_threshold - 0.02))
-        & (rms_norm < 0.10)
-        & (zcr_norm > 0.42)
-        & (centroid_norm > 0.42)
-        & (bandwidth_norm > 0.44)
-    )
-    relaxed_mask = relaxed_mask | rescue_mask | post_phrase_mask | low_energy_breath_mask
-
-    gap_tolerance = max(1, int(round(0.05 / frame_time)))
-    strict_mask = _close_mask(strict_mask, gap_tolerance)
-    relaxed_gap = max(gap_tolerance, int(round(0.08 / frame_time)))
-    relaxed_mask = _close_mask(relaxed_mask, relaxed_gap)
-    rescue_mask = _close_mask(rescue_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
-    bright_breath_mask = _close_mask(bright_breath_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
-    airy_breath_mask = _close_mask(airy_breath_mask, max(relaxed_gap, int(round(0.16 / frame_time))))
-    micro_breath_mask = _close_mask(micro_breath_mask, max(relaxed_gap, int(round(0.08 / frame_time))))
-    short_breath_mask = _close_mask(short_breath_mask, max(gap_tolerance, int(round(0.05 / frame_time))))
-    needle_breath_mask = _close_mask(needle_breath_mask, max(gap_tolerance, int(round(0.06 / frame_time))))
-    core_breath_mask = _close_mask(core_breath_mask, max(gap_tolerance, int(round(0.07 / frame_time))))
-    post_phrase_mask = _close_mask(post_phrase_mask, max(relaxed_gap, int(round(0.10 / frame_time))))
-    low_energy_breath_mask = _close_mask(low_energy_breath_mask, max(gap_tolerance, int(round(0.08 / frame_time))))
-
-    strict_segments = _merge_segments(strict_mask, frame_time, sr)
-    relaxed_segments = _merge_segments(relaxed_mask, frame_time, sr, min_duration=0.08, max_duration=0.60)
-    segments = list(strict_segments)
-    if relaxed_segments:
-        segments = sorted(segments + relaxed_segments, key=lambda item: item[0])
-    rescue_segments = _merge_segments(rescue_mask, frame_time, sr, min_duration=0.18, max_duration=0.40)
-    bright_segments = _merge_segments(bright_breath_mask, frame_time, sr, min_duration=0.16, max_duration=0.48)
-    airy_segments = _merge_segments(airy_breath_mask, frame_time, sr, min_duration=0.15, max_duration=0.50)
-    micro_segments = _merge_segments(micro_breath_mask, frame_time, sr, min_duration=0.12, max_duration=0.50)
-    short_segments = _merge_segments(short_breath_mask, frame_time, sr, min_duration=0.04, max_duration=0.32)
-    needle_segments = _merge_segments(needle_breath_mask, frame_time, sr, min_duration=0.16, max_duration=0.40)
-    core_segments = _merge_segments(core_breath_mask, frame_time, sr, min_duration=0.14, max_duration=0.42)
-    post_phrase_segments = _merge_segments(post_phrase_mask, frame_time, sr, min_duration=0.10, max_duration=0.65)
-    low_energy_segments = _merge_segments(low_energy_breath_mask, frame_time, sr, min_duration=0.08, max_duration=0.52)
-    if rescue_segments:
-        segments = sorted(segments + rescue_segments, key=lambda item: item[0])
-    if bright_segments:
-        segments = sorted(segments + bright_segments, key=lambda item: item[0])
-    if airy_segments:
-        segments = sorted(segments + airy_segments, key=lambda item: item[0])
-    if micro_segments:
-        segments = sorted(segments + micro_segments, key=lambda item: item[0])
-    if short_segments:
-        segments = sorted(segments + short_segments, key=lambda item: item[0])
-    if needle_segments:
-        segments = sorted(segments + needle_segments, key=lambda item: item[0])
-    if core_segments:
-        segments = sorted(segments + core_segments, key=lambda item: item[0])
-    if post_phrase_segments:
-        segments = sorted(segments + post_phrase_segments, key=lambda item: item[0])
-    if low_energy_segments:
-        segments = sorted(segments + low_energy_segments, key=lambda item: item[0])
-
-    silence_mask = _close_mask(rms_norm < 0.05, max(1, int(round(0.80 / frame_time))))
-    silence_segments = _merge_segments(silence_mask, frame_time, sr, min_duration=3.0, max_duration=20.0)
-    if silence_segments:
-        segments = sorted(segments + silence_segments, key=lambda item: item[0])
-    floor_silence_segments = _detect_low_voice_silence_segments(raw_rms, frame_time, sr, voice_floor_threshold)
-    if floor_silence_segments:
-        floor_silence_segments = _snap_right_edge_to_tail_valley(
-            floor_silence_segments,
-            sr,
-            frame_time,
-            raw_rms,
-            peak_reject_threshold,
-            voice_floor_threshold,
-        )
-    if floor_silence_segments:
-        segments = sorted(segments + floor_silence_segments, key=lambda item: item[0])
-
-    segments = _refine_segment_to_core(
-        segments,
-        sr,
-        frame_time,
-        smoothed_score,
-        rms_norm,
-        zcr_norm,
-        centroid_norm,
-    )
-
-    raw_segments = len(segments)
-    scored_segments = []
-    for start, end in segments:
-        start_frame = max(0, int(start / HOP_LENGTH))
-        end_frame = min(len(smoothed_score), int(np.ceil(end / HOP_LENGTH)))
-
-        segment_score = _sample_slice(smoothed_score, start_frame, end_frame)
-        segment_rms = _sample_slice(rms_norm, start_frame, end_frame)
-        segment_flatness = _sample_slice(flatness_norm, start_frame, end_frame)
-        segment_zcr = _sample_slice(zcr_norm, start_frame, end_frame)
-        segment_centroid = _sample_slice(centroid_norm, start_frame, end_frame)
-        segment_bandwidth = _sample_slice(bandwidth_norm, start_frame, end_frame)
-        segment_raw_rms = _sample_slice(raw_rms, start_frame, end_frame)
-        follow_rms = _sample_slice(rms_norm, end_frame, end_frame + max(2, int(round(0.18 / frame_time))))
-        lead_rms_segment = _sample_slice(rms_norm, max(0, start_frame - max(2, int(round(0.10 / frame_time)))), start_frame)
-        lead_raw_segment = _sample_slice(raw_rms, max(0, start_frame - max(2, int(round(0.20 / frame_time)))), start_frame)
-        pre_peak_raw_segment = _sample_slice(raw_rms, max(0, start_frame - max(4, int(round(2.20 / frame_time)))), start_frame)
-        follow_raw_segment = _sample_slice(raw_rms, end_frame, end_frame + max(2, int(round(0.20 / frame_time))))
-
-        if len(segment_score) == 0 or len(segment_rms) == 0 or len(segment_raw_rms) == 0:
-            continue
-
-        duration = (end - start) / sr
-        mean_score = float(np.mean(segment_score))
-        peak_score = float(np.max(segment_score))
-        mean_rms = float(np.mean(segment_rms))
-        peak_rms = float(np.percentile(segment_rms, 90))
-        max_rms = float(np.max(segment_rms))
-        mean_raw_rms = float(np.mean(segment_raw_rms))
-        p90_raw_rms = float(np.percentile(segment_raw_rms, 90))
-        max_raw_rms = float(np.max(segment_raw_rms))
-        texture_score = float(
-            0.35 * np.mean(segment_flatness)
-            + 0.25 * np.mean(segment_zcr)
-            + 0.20 * np.mean(segment_centroid)
-            + 0.20 * np.mean(segment_bandwidth)
-        )
-        inner_slice = slice(max(0, len(segment_rms) // 5), max(1, len(segment_rms) - len(segment_rms) // 5))
-        edge_rms = float(
-            np.mean(np.concatenate((segment_rms[: max(1, len(segment_rms) // 6)], segment_rms[-max(1, len(segment_rms) // 6) :])))
-        )
-        middle_rms = float(np.mean(segment_rms[inner_slice])) if len(segment_rms[inner_slice]) else mean_rms
-        edge_score = float(
-            np.mean(np.concatenate((segment_score[: max(1, len(segment_score) // 6)], segment_score[-max(1, len(segment_score) // 6) :])))
-        )
-        middle_score = float(np.mean(segment_score[inner_slice])) if len(segment_score[inner_slice]) else mean_score
-        middle_texture = float(
-            0.35 * np.mean(segment_flatness[inner_slice])
-            + 0.25 * np.mean(segment_zcr[inner_slice])
-            + 0.20 * np.mean(segment_centroid[inner_slice])
-            + 0.20 * np.mean(segment_bandwidth[inner_slice])
-        ) if len(segment_flatness[inner_slice]) else texture_score
-        mean_flatness = float(np.mean(segment_flatness))
-        mean_zcr = float(np.mean(segment_zcr))
-        mean_centroid = float(np.mean(segment_centroid))
-        mean_bandwidth = float(np.mean(segment_bandwidth))
-        core_hint_ratio = float(
-            np.mean(
-                (segment_rms <= 0.12)
-                & (segment_score >= 0.24)
-                & (segment_zcr >= 0.42)
-                & (segment_centroid >= 0.42)
-            )
-        )
-        follow_mean = float(np.mean(follow_rms)) if len(follow_rms) else mean_rms
-        lead_mean = float(np.mean(lead_rms_segment)) if len(lead_rms_segment) else mean_rms
-        rise_ratio = (follow_mean + 1e-6) / (mean_rms + 1e-6)
-        lead_raw_mean = float(np.mean(lead_raw_segment)) if len(lead_raw_segment) else mean_raw_rms
-        pre_peak_raw = float(np.max(pre_peak_raw_segment)) if len(pre_peak_raw_segment) else max_raw_rms
-        follow_raw_mean = float(np.mean(follow_raw_segment)) if len(follow_raw_segment) else mean_raw_rms
-        lead_raw_p90 = float(np.percentile(lead_raw_segment, 90)) if len(lead_raw_segment) else mean_raw_rms
-        follow_raw_p50 = float(np.percentile(follow_raw_segment, 50)) if len(follow_raw_segment) else mean_raw_rms
-        lead_decay_slope = _linear_slope(lead_raw_segment)
-        seg_shape_slope = _linear_slope(segment_raw_rms)
-        seg_edge_raw = float(
-            np.mean(
-                np.concatenate(
-                    (
-                        segment_raw_rms[: max(1, len(segment_raw_rms) // 6)],
-                        segment_raw_rms[-max(1, len(segment_raw_rms) // 6) :],
-                    )
-                )
-            )
-        )
-        seg_mid_raw = float(np.mean(segment_raw_rms[inner_slice])) if len(segment_raw_rms[inner_slice]) else mean_raw_rms
-        post_phrase_release = (
-            lead_raw_mean >= max(mean_raw_rms * 1.30, global_noise_p35 * 1.45)
-            and lead_decay_slope <= -max(global_noise_p35 * 0.01, 0.0003)
-            and mean_raw_rms <= min(global_voice_p75 * 0.68, global_voice_p87 * 0.52)
-            and mean_score >= max(0.20, relaxed_threshold - 0.02)
-            and mean_zcr >= 0.40
-            and mean_centroid >= 0.40
-            and mean_bandwidth >= 0.42
-            and seg_mid_raw >= max(follow_raw_p50 * 1.08, global_noise_p35 * 1.02)
-            and seg_shape_slope <= max(global_noise_p35 * 0.005, 0.0002)
-        )
-        pre_drop_ratio = (pre_peak_raw + 1e-6) / (max_raw_rms + 1e-6)
-        abrupt_pre_drop = (
-            pre_peak_raw >= max(peak_reject_threshold * 1.25, percentile_reject_threshold * 1.45, global_voice_p75 * 0.80)
-            and pre_drop_ratio >= 2.2
-            and lead_raw_mean >= mean_raw_rms * 1.45
-        )
-        hard_peak_reject = max_raw_rms > (breath_rms_cap + 1e-6)
-        hard_percentile_reject = p90_raw_rms > (percentile_reject_threshold + 1e-6)
-        voice_peak_reject = (
-            duration <= 0.50
-            and (
-                hard_peak_reject
-                or hard_percentile_reject
-                or (lead_raw_p90 > 0 and p90_raw_rms >= lead_raw_p90 * 0.92 and mean_raw_rms >= lead_raw_mean * 0.72)
-            )
-            and mean_flatness <= 0.14
-            and core_hint_ratio < 0.30
-        ) or (
-            duration <= 0.50
-            and mean_raw_rms >= global_voice_p75 * 0.95
-            and p90_raw_rms >= global_voice_p87 * 0.80
-            and mean_flatness <= 0.12
-            and core_hint_ratio < 0.30
-        ) or (
-            duration <= 0.50
-            and seg_edge_raw >= seg_mid_raw * 0.92
-            and p90_raw_rms >= global_voice_p75 * 1.05
-            and mean_flatness <= 0.12
-            and core_hint_ratio < 0.28
-        )
-
-        low_voice_force_keep = (
-            voice_floor_threshold > 0.0
-            and duration <= 0.72
-            and max_raw_rms <= voice_floor_threshold + 1e-6
-            and max_raw_rms <= breath_rms_cap + 1e-6
-        )
-
-        # 相对谷值气息：仅在用户主动提高 peak_reject（>0.08）时激活。
-        # 判断标准：段能量低于前后各1s的中位数，且前后都明显更高（真实谷值）。
-        # breath_rms_cap 仍然是上限，保证不会把响亮的歌声误判为气息。
-        valley_lead_raw = _sample_slice(raw_rms, max(0, start_frame - max(3, int(round(1.0 / frame_time)))), start_frame)
-        valley_follow_raw = _sample_slice(raw_rms, end_frame, end_frame + max(3, int(round(1.0 / frame_time))))
-        valley_lead_med = float(np.median(valley_lead_raw)) if len(valley_lead_raw) else 0.0
-        valley_follow_med = float(np.median(valley_follow_raw)) if len(valley_follow_raw) else 0.0
-        valley_ratio_lead = (valley_lead_med + 1e-6) / (mean_raw_rms + 1e-6)
-        valley_ratio_follow = (valley_follow_med + 1e-6) / (mean_raw_rms + 1e-6)
-        relative_valley_keep = (
-            peak_reject_threshold > 0.08
-            and not hard_peak_reject
-            and not hard_percentile_reject
-            and 0.05 <= duration <= 0.45
-            and valley_ratio_lead >= 2.0
-            and valley_ratio_follow >= 2.0
-            and valley_lead_med >= breath_rms_cap * 0.55
-            and valley_follow_med >= breath_rms_cap * 0.55
-            and mean_raw_rms <= breath_rms_cap * 0.75
-        )
-
-        keep = low_voice_force_keep or relative_valley_keep or (
-            (0.05 <= duration <= 0.58)
-            and (mean_score >= max(0.18, strict_threshold - 0.06))
-            and (peak_score >= strict_threshold + 0.02)
-            and (texture_score >= max(0.16, noise_floor - 0.02))
-            and (
-                (mean_rms <= min(energy_ceiling * 0.28, 0.16))
-                or (core_hint_ratio >= 0.16 and peak_score >= strict_threshold + 0.06 and duration <= 0.65)
-            )
-            and (
-                (rise_ratio >= max(1.02, 1.55 - sensitivity * 0.04) and follow_mean >= max(mean_rms * 1.05, lead_mean * 0.98, 0.02))
-                or (mean_zcr >= 0.50 and mean_centroid >= 0.48 and mean_rms <= 0.07)
-                or (
-                    duration <= 0.26
-                    and mean_score >= max(0.20, strict_threshold - 0.07)
-                    and mean_zcr >= 0.46
-                    and mean_centroid >= 0.44
-                    and follow_mean >= max(mean_rms * 1.02, 0.018)
-                )
-                or (
-                    duration <= 0.40
-                    and middle_rms <= 0.08
-                    and middle_score >= max(0.27, strict_threshold - 0.01)
-                    and mean_zcr >= 0.44
-                    and mean_centroid >= 0.43
-                )
-                or abrupt_pre_drop
-                or post_phrase_release
-            )
-            and (lead_mean <= mean_rms * 1.40)
-            and not hard_peak_reject
-            and not hard_percentile_reject
-            and not voice_peak_reject
-            and not (
-                duration <= 0.42
-                and mean_rms >= 0.07
-                and edge_rms >= middle_rms * 1.10
-                and edge_score <= middle_score * 0.92
-                and middle_texture <= texture_score * 0.98
-            )
-            and not (
-                duration <= 0.45
-                and mean_rms >= 0.18
-                and mean_flatness <= 0.12
-                and core_hint_ratio < 0.22
-            )
-            and not (
-                duration <= 0.46
-                and peak_rms >= 0.26
-                and mean_flatness <= 0.11
-                and core_hint_ratio < 0.26
-            )
-            and not (
-                duration <= 0.48
-                and peak_rms >= 0.34
-                and mean_rms >= 0.22
-                and mean_flatness <= 0.12
-                and core_hint_ratio < 0.30
-            )
-        )
-        if keep:
-            scored_segments.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "duration": duration,
-                    "mean_score": mean_score,
-                    "peak_score": peak_score,
-                    "mean_rms": mean_rms,
-                    "rise_ratio": rise_ratio,
-                    "texture_score": texture_score,
-                }
-            )
-
-    scored_segments = _merge_nearby_segments(scored_segments, sr, max_gap=0.16, max_duration=0.72)
-    filtered = []
-    last_end = -1
-    for item in scored_segments:
-        if item["start"] < last_end - int(0.04 * sr):
-            continue
-        filtered.append((item["start"], min(item["end"], len(y))))
-        last_end = item["end"]
-
-    filtered = _expand_segment_edges(
-        filtered,
-        sr,
-        frame_time,
-        relaxed_threshold,
-        energy_ceiling,
-        smoothed_score,
-        rms_norm,
-        zcr_norm,
-        centroid_norm,
-    )
-    filtered = _refine_segment_to_core(
-        filtered,
-        sr,
-        frame_time,
-        smoothed_score,
-        rms_norm,
-        zcr_norm,
-        centroid_norm,
-    )
-    filtered = _trim_segment_heads_tails(
-        filtered,
-        sr,
-        frame_time,
-        smoothed_score,
-        rms_norm,
-        zcr_norm,
-        centroid_norm,
-        bandwidth_norm,
-    )
-    filtered = _extend_breath_edges(
-        filtered,
-        sr,
-        frame_time,
-        smoothed_score,
-        rms_norm,
-        zcr_norm,
-        centroid_norm,
-        bandwidth_norm,
-    )
-    filtered = _trim_loud_edges_by_threshold(
-        filtered,
-        sr,
-        frame_time,
-        raw_rms,
-        breath_rms_cap,
-        percentile_reject_threshold,
-    )
-    filtered = _trim_rising_voice_right_edges(
-        filtered,
-        sr,
-        frame_time,
-        raw_rms,
-        breath_rms_cap,
-        percentile_reject_threshold,
-        voice_floor_threshold,
-    )
-    filtered = _trim_following_voice_onset(
-        filtered,
-        sr,
-        frame_time,
-        raw_rms,
-        breath_rms_cap,
-        percentile_reject_threshold,
-        voice_floor_threshold,
-    )
-    filtered = _snap_right_edge_to_tail_valley(
-        filtered,
-        sr,
-        frame_time,
-        raw_rms,
-        breath_rms_cap,
-        voice_floor_threshold,
-    )
-    if floor_silence_segments:
-        filtered_ranges = [(start / sr, end / sr) for start, end in filtered]
-        floor_ranges = [(start / sr, end / sr) for start, end in floor_silence_segments]
-        floor_ranges = _subtract_time_ranges(floor_ranges, filtered_ranges)
-        filtered = _merge_time_ranges(
-            filtered_ranges + floor_ranges,
-            min_gap_sec=0.0,
-        )
-        filtered = _time_ranges_to_samples(filtered, sr, len(y))
-
-    if min_segment_length_ms > 0:
-        min_samples = int((min_segment_length_ms / 1000.0) * sr)
-        filtered = [(start, end) for start, end in filtered if (end - start) >= min_samples]
-
-    durations = [float((end - start) / sr) for start, end in filtered]
-    diagnostics = {
-        "candidate_hits": int(np.count_nonzero(candidate_mask)),
-        "strict_hits": int(np.count_nonzero(strict_mask)),
-        "relaxed_hits": int(np.count_nonzero(relaxed_mask)),
-        "raw_segments": raw_segments,
-        "kept_segments": len(filtered),
-        "max_score": float(np.max(smoothed_score)),
-        "mean_score": float(np.mean(smoothed_score)),
-        "avg_duration": float(np.mean(durations)) if durations else 0.0,
-        "avg_rise_ratio": float(np.mean([item["rise_ratio"] for item in scored_segments])) if scored_segments else 0.0,
-        "smooth_frames": int(smooth_frames),
-        "strict_threshold": float(strict_threshold),
-    }
-    return filtered, diagnostics
-
-
-def _format_diagnostics_text(diagnostics, segment_count):
-    if not diagnostics:
-        return "诊断：未处理"
-    return (
-        f"诊断：候选帧 {diagnostics['candidate_hits']}，"
-        f"严格命中 {diagnostics['strict_hits']}，"
-        f"宽松命中 {diagnostics['relaxed_hits']}，"
-        f"原始片段 {diagnostics['raw_segments']}，"
-        f"最终片段 {segment_count}，"
-        f"最高分 {diagnostics['max_score']:.2f}，"
-        f"平均分 {diagnostics['mean_score']:.2f}，"
-        f"平均时长 {diagnostics['avg_duration']:.2f}s，"
-        f"平均后升比 {diagnostics['avg_rise_ratio']:.2f}，"
-        f"平滑窗口 {diagnostics['smooth_frames']} 帧，"
-        f"严格阈值 {diagnostics['strict_threshold']:.2f}"
-    )
-
-
-def _build_output_path(input_path):
-    source = Path(input_path)
-    return source.with_name(f"{source.stem}_v{VERSION}.mp3")
-
-
-def _expand_segments(segments, sr, total_length, left_append_ms=LEFT_APPEND_MS, right_append_ms=RIGHT_APPEND_MS):
-    if not segments or sr is None or sr <= 0:
-        return segments
-    left_samples = int(round((left_append_ms / 1000.0) * sr))
-    right_samples = int(round((right_append_ms / 1000.0) * sr))
-    expanded = []
-    for start, end in segments:
-        new_start = start - left_samples
-        new_end = end + right_samples
-        new_start = max(0, min(new_start, total_length))
-        new_end = max(0, min(new_end, total_length))
-        if new_end > new_start:
-            expanded.append((new_start, new_end))
-    merged = _merge_time_ranges([(start / sr, end / sr) for start, end in expanded], min_gap_sec=0.002)
-    return _time_ranges_to_samples(merged, sr, total_length)
-
-
-def _write_output_mp3(y_processed, sr, output_path, bitrate_kbps=128):
-    ffmpeg_bin = _find_ffmpeg_binary()
-    temp_wav = tempfile.NamedTemporaryFile(prefix="breath_processed_", suffix=".wav", delete=False)
-    temp_wav.close()
-    sf.write(temp_wav.name, y_processed, sr, subtype="FLOAT")
-    bitrate_kbps = int(np.clip(int(bitrate_kbps), 64, 320))
-    try:
-        _run_ffmpeg(
-            [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                temp_wav.name,
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                f"{bitrate_kbps}k",
-                str(output_path),
-            ],
-            error_prefix="导出 MP3 失败",
-        )
-    finally:
-        if os.path.exists(temp_wav.name):
-            os.remove(temp_wav.name)
-
-
-def _find_ffmpeg_binary():
-    candidates = [
-        shutil.which("ffmpeg"),
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/opt/local/bin/ffmpeg",
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    raise RuntimeError(
-        "处理失败：未找到 ffmpeg。请确认已安装 ffmpeg，或把它放在 /opt/homebrew/bin/ffmpeg"
-    )
-
-
-def _merge_time_ranges(ranges, min_gap_sec=0.0):
-    if not ranges:
-        return []
-    merged = []
-    min_gap_sec = float(max(0.0, min_gap_sec))
-    for start, end in sorted((float(s), float(e)) for s, e in ranges if e > s):
-        if not merged:
-            merged.append([start, end])
-            continue
-        prev = merged[-1]
-        if start <= prev[1] + min_gap_sec:
-            prev[1] = max(prev[1], end)
-        else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
-
-
-def _merge_sample_segments(segments, total_length=None):
-    """Merge overlapping/touching sample ranges so render never double-appends audio."""
-    cleaned = []
-    for start, end in segments or []:
-        start_i = int(start)
-        end_i = int(end)
-        if total_length is not None:
-            total_i = int(total_length)
-            start_i = max(0, min(start_i, total_i))
-            end_i = max(0, min(end_i, total_i))
-        if end_i > start_i:
-            cleaned.append((start_i, end_i))
-    if not cleaned:
-        return []
-    cleaned.sort(key=lambda item: (item[0], item[1]))
-    merged = [[cleaned[0][0], cleaned[0][1]]]
-    for start_i, end_i in cleaned[1:]:
-        prev = merged[-1]
-        if start_i <= prev[1]:
-            prev[1] = max(prev[1], end_i)
-        else:
-            merged.append([start_i, end_i])
-    return [(start_i, end_i) for start_i, end_i in merged]
-
-
-def _is_half_time_sample_segment(start, end, half_time_segments, sr, tolerance_sec=HALF_TIME_MATCH_TOLERANCE_SEC):
-    """True if this sample range intersects any half-time range (or matches within tolerance)."""
-    if not half_time_segments or end <= start:
-        return False
-    start = int(start)
-    end = int(end)
-    tol = max(1, int(round(float(tolerance_sec) * float(sr or 1))))
-    for half_start, half_end in half_time_segments:
-        hs = int(half_start)
-        he = int(half_end)
-        if he <= hs:
-            continue
-        if abs(hs - start) <= tol and abs(he - end) <= tol:
-            return True
-        if max(0, min(end, he) - max(start, hs)) > 0:
-            return True
-    return False
-
-
-def _half_time_overlaps_in_range(start, end, half_time_segments):
-    """Merged half-time sample ranges clipped to [start, end]."""
-    start = int(start)
-    end = int(end)
-    if end <= start or not half_time_segments:
-        return []
-    overlaps = []
-    for half_start, half_end in half_time_segments:
-        hs = max(start, int(half_start))
-        he = min(end, int(half_end))
-        if he > hs:
-            overlaps.append((hs, he))
-    return _merge_sample_segments(overlaps, total_length=end)
-
-
-def _split_segment_by_half_time(start, end, half_time_segments):
-    """
-    Split [start, end] into contiguous pieces tagged with half-time.
-    Ensures half-time still applies after breath segments are merged.
-    """
-    start = int(start)
-    end = int(end)
-    if end <= start:
-        return []
-    halves = _half_time_overlaps_in_range(start, end, half_time_segments)
-    if not halves:
-        return [(start, end, False)]
-    pieces = []
-    cursor = start
-    for hs, he in halves:
-        if hs > cursor:
-            pieces.append((cursor, hs, False))
-        pieces.append((hs, he, True))
-        cursor = he
-    if cursor < end:
-        pieces.append((cursor, end, False))
-    return pieces
-
-
-def _smooth_gain_attack_release(target_gain, sr, attack_sec, release_sec, control_rate_hz=LIMITER_CONTROL_RATE_HZ):
-    """Attack/release envelope with optional control-rate downsampling for speed."""
-    target_gain = np.asarray(target_gain, dtype=np.float32)
-    n = len(target_gain)
-    if n == 0:
-        return target_gain
-
-    hop = max(1, int(round(float(sr) / max(float(control_rate_hz), 1.0))))
-    if hop > 1 and n > hop * 4:
-        pad = (-n) % hop
-        padded = np.pad(target_gain, (0, pad), mode="edge")
-        blocks = padded.reshape(-1, hop)
-        # Prefer more reduction within each block so peaks stay limited after upsample.
-        coarse = np.min(blocks, axis=1).astype(np.float32)
-        coarse_sr = float(sr) / float(hop)
-        attack_coeff = float(np.exp(-1.0 / max(1.0, coarse_sr * attack_sec)))
-        release_coeff = float(np.exp(-1.0 / max(1.0, coarse_sr * release_sec)))
-        smooth = np.empty_like(coarse)
-        smooth[0] = coarse[0]
-        for idx in range(1, len(coarse)):
-            coeff = attack_coeff if coarse[idx] < smooth[idx - 1] else release_coeff
-            smooth[idx] = coeff * smooth[idx - 1] + (1.0 - coeff) * coarse[idx]
-        x_coarse = (np.arange(len(smooth), dtype=np.float32) + 0.5) * hop - 0.5
-        x_coarse = np.clip(x_coarse, 0.0, float(n - 1))
-        x_full = np.arange(n, dtype=np.float32)
-        return np.interp(x_full, x_coarse, smooth).astype(np.float32)
-
-    attack_coeff = float(np.exp(-1.0 / max(1.0, float(sr) * attack_sec)))
-    release_coeff = float(np.exp(-1.0 / max(1.0, float(sr) * release_sec)))
-    smooth = np.empty_like(target_gain)
-    smooth[0] = target_gain[0]
-    for idx in range(1, n):
-        coeff = attack_coeff if target_gain[idx] < smooth[idx - 1] else release_coeff
-        smooth[idx] = coeff * smooth[idx - 1] + (1.0 - coeff) * target_gain[idx]
-    return smooth
-
-
-def _run_ffmpeg(args, error_prefix="ffmpeg 失败"):
-    """Run ffmpeg and surface stderr tail on failure."""
-    try:
-        completed = subprocess.run(
-            args,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return completed
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"{error_prefix}：找不到可执行文件 {args[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr_text = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
-        tail = stderr_text[-800:] if stderr_text else "(无 stderr)"
-        raise RuntimeError(f"{error_prefix}：\n{tail}") from exc
-
-
-def _subtract_time_ranges(base_ranges, remove_ranges):
-    if not base_ranges:
-        return []
-    if not remove_ranges:
-        return [(float(start), float(end)) for start, end in base_ranges if end > start]
-
-    remaining = [(float(start), float(end)) for start, end in base_ranges if end > start]
-    for remove_start, remove_end in _merge_time_ranges(remove_ranges):
-        next_remaining = []
-        for start, end in remaining:
-            if remove_end <= start or remove_start >= end:
-                next_remaining.append((start, end))
-                continue
-            if remove_start > start:
-                next_remaining.append((start, min(remove_start, end)))
-            if remove_end < end:
-                next_remaining.append((max(remove_end, start), end))
-        remaining = next_remaining
-    return _merge_time_ranges(remaining)
-
-
-def _time_ranges_to_samples(ranges, sr, total_length):
-    segments = []
-    for start_sec, end_sec in ranges:
-        start = max(0, int(round(start_sec * sr)))
-        end = min(total_length, int(round(end_sec * sr)))
-        if end > start:
-            segments.append((start, end))
-    return segments
-
-
-def _intersect_time_ranges(base_ranges, target_range):
-    target_start, target_end = float(target_range[0]), float(target_range[1])
-    if target_end <= target_start:
-        return []
-    overlaps = []
-    for start, end in base_ranges:
-        overlap_start = max(float(start), target_start)
-        overlap_end = min(float(end), target_end)
-        if overlap_end > overlap_start:
-            overlaps.append((overlap_start, overlap_end))
-    return _merge_time_ranges(overlaps)
-
-
-def _build_half_time_segment(segment):
-    segment = np.asarray(segment, dtype=np.float32)
-    keep_len = max(1, len(segment) // 2)
-    if len(segment) <= 2:
-        if segment.ndim > 1:
-            return np.zeros((keep_len, segment.shape[1]), dtype=np.float32)
-        return np.zeros(keep_len, dtype=np.float32)
-        
-    source_idx = np.linspace(0, len(segment) - 1, keep_len, dtype=np.float32)
-    original_idx = np.arange(len(segment), dtype=np.float32)
-    
-    if segment.ndim > 1:
-        compressed = np.empty((keep_len, segment.shape[1]), dtype=np.float32)
-        for ch in range(segment.shape[1]):
-            compressed[:, ch] = np.interp(source_idx, original_idx, segment[:, ch])
-    else:
-        compressed = np.interp(source_idx, original_idx, segment).astype(np.float32)
-        
-    fade_len = min(max(16, keep_len // 8), keep_len)
-    if fade_len > 1:
-        fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-        fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-        if compressed.ndim > 1:
-            fade_in = fade_in[:, None]
-            fade_out = fade_out[:, None]
-        compressed[:fade_len] *= fade_in
-        compressed[keep_len - fade_len:keep_len] *= fade_out
-    return compressed
-
-
-def _build_breath_silence_envelope(segment, sr, gain):
-    segment = np.asarray(segment, dtype=np.float32)
-    sample_count = segment.shape[0] if segment.ndim > 1 else len(segment)
-    center_gain = float(np.clip(gain, 0.0, 1.0))
-    if center_gain <= 0.035:
-        center_gain = 0.0
-    envelope = np.full(sample_count, center_gain, dtype=np.float32)
-    if sample_count == 0:
-        return envelope
-
-    left_feather_len = min(int(0.050 * sr), max(sample_count - 1, 1))
-    right_feather_len = min(int(0.050 * sr), max(sample_count - 1, 1))
-    overlap_guard = max(1, sample_count // 2)
-    left_feather_len = min(left_feather_len, overlap_guard)
-    right_feather_len = min(right_feather_len, overlap_guard)
-
-    if left_feather_len > 1:
-        left_mix = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, left_feather_len, dtype=np.float32))
-        left_curve = center_gain + (1.0 - center_gain) * left_mix
-        envelope[:left_feather_len] = np.maximum(envelope[:left_feather_len], left_curve)
-    else:
-        envelope[0] = 1.0
-
-    if right_feather_len > 1:
-        right_mix = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, right_feather_len, dtype=np.float32))
-        right_curve = center_gain + (1.0 - center_gain) * right_mix
-        envelope[-right_feather_len:] = np.maximum(envelope[-right_feather_len:], right_curve)
-    else:
-        envelope[-1] = 1.0
-
-    return np.clip(envelope, 0.0, 1.0)
-
-
-def _build_processed_segment(segment, sr, gain, half_time=False):
-    segment = np.asarray(segment, dtype=np.float32)
-    if half_time:
-        compressed = _build_half_time_segment(segment)
-        envelope = _build_breath_silence_envelope(compressed, sr, gain).astype(np.float32)
-        if compressed.ndim > 1:
-            return compressed * envelope[:, None]
-        return compressed * envelope
-    envelope = _build_breath_silence_envelope(segment, sr, gain).astype(np.float32)
-    if segment.ndim > 1:
-        return segment * envelope[:, None]
-    return segment * envelope
-
-
-def _render_output_audio(y, sr, breath_segments, atten_db=18, half_time_segments=None):
-    source_audio = np.asarray(y, dtype=np.float32)
-    gain = np.power(10, -atten_db / 20)
-    total_length = len(source_audio)
-    # Force non-overlapping sample ranges so cursor-based concat never double-counts.
-    breath_segments = _merge_sample_segments(breath_segments, total_length=total_length)
-    half_time_segments = _merge_sample_segments(half_time_segments or [], total_length=total_length)
-    rendered_chunks = []
-    timeline_segments = []
-    cursor = 0
-    output_cursor = 0
-
-    for start, end in breath_segments:
-        start = max(0, int(start))
-        end = min(int(end), total_length)
-        if end <= start:
-            continue
-        if start < cursor:
-            # Defensive: merged list should not overlap; clamp if it does.
-            start = cursor
-            if end <= start:
-                continue
-        if start > cursor:
-            chunk = np.asarray(source_audio[cursor:start], dtype=np.float32)
-            rendered_chunks.append(chunk)
-            next_cursor = output_cursor + len(chunk)
-            timeline_segments.append((cursor, start, output_cursor, next_cursor))
-            output_cursor = next_cursor
-
-        # Split by half-time intersections so merge of adjacent breath segments
-        # does not drop partial half-time ranges.
-        for piece_start, piece_end, use_half in _split_segment_by_half_time(start, end, half_time_segments):
-            segment = np.asarray(source_audio[piece_start:piece_end], dtype=np.float32)
-            processed = _build_processed_segment(segment, sr, gain, half_time=use_half)
-            rendered_chunks.append(processed)
-            next_cursor = output_cursor + len(processed)
-            timeline_segments.append((piece_start, piece_end, output_cursor, next_cursor))
-            output_cursor = next_cursor
-        cursor = end
-
-    if cursor < total_length:
-        chunk = np.asarray(source_audio[cursor:], dtype=np.float32)
-        rendered_chunks.append(chunk)
-        next_cursor = output_cursor + len(chunk)
-        timeline_segments.append((cursor, total_length, output_cursor, next_cursor))
-        output_cursor = next_cursor
-
-    if not rendered_chunks:
-        return np.asarray([], dtype=np.float32), []
-    return np.concatenate(rendered_chunks, axis=0).astype(np.float32), timeline_segments
-
-
-def _apply_breath_segments(y, sr, breath_segments, atten_db=18, half_time_segments=None):
-    output_audio, _ = _render_output_audio(
-        y,
-        sr,
-        breath_segments,
-        atten_db=atten_db,
-        half_time_segments=half_time_segments,
-    )
-    return output_audio
-
-
-def _load_audio_for_processing(input_path):
-    ffmpeg_bin = _find_ffmpeg_binary()
-    temp_wav = tempfile.NamedTemporaryFile(prefix="breath_input_decode_", suffix=".wav", delete=False)
-    temp_wav.close()
-    try:
-        _run_ffmpeg(
-            [
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                input_path,
-                "-vn",
-                "-map",
-                "a:0",
-                "-acodec",
-                "pcm_f32le",
-                temp_wav.name,
-            ],
-            error_prefix="解码音频失败",
-        )
-        y_full, sr = sf.read(temp_wav.name, dtype="float32", always_2d=False)
-    finally:
-        if os.path.exists(temp_wav.name):
-            os.remove(temp_wav.name)
-    y_full = np.asarray(y_full, dtype=np.float32)
-    if y_full.ndim == 1:
-        # Mono: share one buffer for analysis and playback (no forced copy).
-        playback_audio = y_full
-        analysis_audio = y_full
-    else:
-        playback_audio = np.asarray(y_full, dtype=np.float32)
-        analysis_audio = np.asarray(librosa.to_mono(y_full.T), dtype=np.float32)
-    return analysis_audio, playback_audio, sr
-
-
-def _apply_output_headroom(audio, target_peak=0.98):
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.size == 0:
-        return audio, 1.0
-    peak = float(np.max(np.abs(audio)))
-    if peak <= 0.0 or peak <= float(target_peak):
-        return audio, 1.0
-    gain = float(target_peak) / peak
-    return (audio * gain).astype(np.float32), gain
-
-
-def _apply_hot_peak_limiter(audio, sr, threshold=0.84):
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.size == 0:
-        return audio
-    if audio.ndim == 1:
-        control = np.abs(audio)
-    else:
-        control = np.max(np.abs(audio), axis=1)
-    if control.size == 0:
-        return audio.astype(np.float32)
-
-    target_gain = np.ones_like(control, dtype=np.float32)
-    hot_mask = control > float(threshold)
-    if not np.any(hot_mask):
-        return audio.astype(np.float32)
-    target_gain[hot_mask] = float(threshold) / np.maximum(control[hot_mask], 1e-6)
-
-    gain_curve = _smooth_gain_attack_release(
-        target_gain,
-        sr,
-        attack_sec=0.0008,
-        release_sec=0.080,
-    )
-
-    lookahead = max(1, int(round(sr * 0.004)))
-    if len(gain_curve) > lookahead:
-        shifted = gain_curve.copy()
-        shifted[:-lookahead] = gain_curve[lookahead:]
-        shifted[-lookahead:] = gain_curve[-1]
-        gain_curve = np.minimum(gain_curve, shifted)
-
-    gain_curve = np.clip(gain_curve, 0.55, 1.0).astype(np.float32)
-    return _apply_sample_gain_curve(audio, gain_curve)
-
-
-def _smoothstep(values):
-    values = np.asarray(values, dtype=np.float32)
-    clipped = np.clip(values, 0.0, 1.0)
-    return clipped * clipped * (3.0 - 2.0 * clipped)
-
-
-def _compute_loud_phrase_taming_gain(audio, sr):
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.size == 0:
-        return np.asarray([], dtype=np.float32), {
-            "active": False,
-            "threshold": 0.0,
-            "peak": 0.0,
-            "min_gain": 1.0,
-        }
-
-    if audio.ndim == 1:
-        control = np.abs(audio)
-    else:
-        control = np.max(np.abs(audio), axis=1)
-    if control.size == 0:
-        return np.asarray([], dtype=np.float32), {
-            "active": False,
-            "threshold": 0.0,
-            "peak": 0.0,
-            "min_gain": 1.0,
-        }
-
-    fast_window = max(1, int(round(sr * 0.0015)))
-    body_window = max(1, int(round(sr * 0.010)))
-    fast_env = _moving_average(control, fast_window)
-    body_env = _moving_average(control, body_window)
-    control_env = np.maximum(fast_env, body_env * 1.06)
-    control_peak = float(np.max(control_env))
-    if control_peak <= 0.0:
-        return np.ones_like(control_env, dtype=np.float32), {
-            "active": False,
-            "threshold": 0.0,
-            "peak": control_peak,
-            "min_gain": 1.0,
-        }
-
-    p90 = float(np.percentile(control_env, 90))
-    p96 = float(np.percentile(control_env, 96))
-    p995 = float(np.percentile(control_env, 99.5))
-    threshold = max(p96, p90 * 1.12, 0.14)
-    if control_peak <= threshold * 1.02:
-        return np.ones_like(control_env, dtype=np.float32), {
-            "active": False,
-            "threshold": threshold,
-            "peak": control_peak,
-            "min_gain": 1.0,
-        }
-
-    ratio = 4.8
-    knee = max(threshold * 0.34, 0.025)
-    desired = control_env.copy()
-    hard_mask = control_env > threshold
-    desired[hard_mask] = threshold + (control_env[hard_mask] - threshold) / ratio
-    hard_gain = np.ones_like(control_env, dtype=np.float32)
-    hard_gain[hard_mask] = desired[hard_mask] / np.maximum(control_env[hard_mask], 1e-6)
-
-    knee_start = threshold - knee
-    knee_end = threshold + knee
-    knee_mix = _smoothstep((control_env - knee_start) / max(knee_end - knee_start, 1e-6))
-    target_gain = 1.0 - knee_mix * (1.0 - hard_gain)
-
-    extra_hot = np.clip((control_env - p995) / max(control_peak - p995, 1e-6), 0.0, 1.0)
-    fast_hot = np.clip((fast_env - threshold) / max(control_peak - threshold, 1e-6), 0.0, 1.0)
-    transient_ratio = fast_env / np.maximum(body_env, 1e-4)
-    transient_hot = np.clip((transient_ratio - 1.08) / 0.55, 0.0, 1.0) * np.clip(
-        (fast_env - threshold * 0.90) / max(control_peak - threshold * 0.90, 1e-6),
-        0.0,
-        1.0,
-    )
-    target_gain *= 1.0 - 0.18 * extra_hot
-    target_gain *= 1.0 - 0.16 * fast_hot
-    target_gain *= 1.0 - 0.32 * transient_hot
-    target_gain = np.clip(target_gain, 0.38, 1.0)
-
-    smoothed_gain = _smooth_gain_attack_release(
-        target_gain,
-        sr,
-        attack_sec=0.0018,
-        release_sec=0.120,
-    )
-    lookahead = max(1, int(round(sr * 0.008)))
-    if len(smoothed_gain) > lookahead:
-        lookahead_gain = smoothed_gain.copy()
-        lookahead_gain[:-lookahead] = smoothed_gain[lookahead:]
-        lookahead_gain[-lookahead:] = smoothed_gain[-1]
-        smoothed_gain = np.minimum(smoothed_gain, lookahead_gain)
-    smoothed_gain = np.clip(smoothed_gain, 0.38, 1.0).astype(np.float32)
-    return smoothed_gain, {
-        "active": True,
-        "threshold": threshold,
-        "peak": control_peak,
-        "min_gain": float(np.min(smoothed_gain)),
-    }
-
-
-def _apply_sample_gain_curve(audio, gain_curve, *, in_place=False):
-    audio = np.asarray(audio, dtype=np.float32)
-    gain_curve = np.asarray(gain_curve, dtype=np.float32)
-    if audio.size == 0 or gain_curve.size == 0:
-        return audio.astype(np.float32)
-    usable = min(len(audio), len(gain_curve))
-    if in_place:
-        adjusted = audio
-    else:
-        adjusted = audio.copy()
-    if adjusted.ndim == 1:
-        adjusted[:usable] *= gain_curve[:usable]
-    else:
-        adjusted[:usable] *= gain_curve[:usable, None]
-    return adjusted.astype(np.float32, copy=False)
-
-
-def _load_actual_output_audio(output_path):
-    analysis_audio, playback_audio, _ = _load_audio_for_processing(str(output_path))
-    return np.asarray(analysis_audio, dtype=np.float32), np.asarray(playback_audio, dtype=np.float32)
-
-
-def _audio_buffers_share_content(a, b):
-    """True when plot/playback can share one limited/render result (mono shared buffer)."""
-    if a is b:
-        return True
-    a = np.asarray(a)
-    b = np.asarray(b)
-    if a.shape != b.shape or a.ndim != 1 or b.ndim != 1:
-        return False
-    # Same underlying memory or exact object content for mono.
-    return a.__array_interface__["data"][0] == b.__array_interface__["data"][0]
-
-
-def _finalize_rendered_output(output_plot_audio, output_playback_audio, sr):
-    output_plot_audio = np.asarray(output_plot_audio, dtype=np.float32)
-    output_playback_audio = np.asarray(output_playback_audio, dtype=np.float32)
-    share = _audio_buffers_share_content(output_plot_audio, output_playback_audio)
-
-    loud_taming_gain, _ = _compute_loud_phrase_taming_gain(output_playback_audio, sr)
-    output_playback_audio = _apply_sample_gain_curve(output_playback_audio, loud_taming_gain)
-    if share:
-        output_plot_audio = output_playback_audio
-    else:
-        output_plot_audio = _apply_sample_gain_curve(output_plot_audio, loud_taming_gain)
-
-    output_playback_audio, output_headroom_gain = _apply_output_headroom(output_playback_audio)
-    if share:
-        output_plot_audio = output_playback_audio
-    else:
-        output_plot_audio = (output_plot_audio * output_headroom_gain).astype(np.float32)
-
-    output_playback_audio = _apply_hot_peak_limiter(output_playback_audio, sr)
-    if share:
-        output_plot_audio = output_playback_audio
-    else:
-        output_plot_audio = _apply_hot_peak_limiter(output_plot_audio, sr)
-    return (
-        np.asarray(output_plot_audio, dtype=np.float32),
-        np.asarray(output_playback_audio, dtype=np.float32),
-        float(output_headroom_gain),
-    )
-
-
-def process_breath(
-    input_path,
-    atten_db=18,
-    sensitivity=7,
-    peak_reject_threshold=0.20,
-    percentile_reject_threshold=0.20,
-    voice_floor_threshold=0.0,
-    left_append_ms=LEFT_APPEND_MS,
-    right_append_ms=RIGHT_APPEND_MS,
-    min_segment_length_ms=0.0,
-):
-    try:
-        analysis_audio, playback_audio, sr = _load_audio_for_processing(input_path)
-        breath_segments, diagnostics = _detect_breath_segments(
-            analysis_audio,
-            sr,
-            sensitivity,
-            peak_reject_threshold,
-            percentile_reject_threshold,
-            voice_floor_threshold,
-            min_segment_length_ms,
-        )
-        breath_segments = _expand_segments(
-            breath_segments,
-            sr,
-            len(analysis_audio),
-            left_append_ms=left_append_ms,
-            right_append_ms=right_append_ms,
-        )
-        limited_plot, limited_playback, output_headroom_gain = _finalize_rendered_output(
-            analysis_audio,
-            playback_audio,
-            sr,
-        )
-        y_processed_plot, output_timeline_segments = _render_output_audio(
-            limited_plot,
-            sr,
-            breath_segments,
-            atten_db=atten_db,
-        )
-        # Mono (shared limited buffers): one render is enough for plot + playback.
-        if _audio_buffers_share_content(limited_plot, limited_playback):
-            y_processed_playback = y_processed_plot
-        else:
-            y_processed_playback, _ = _render_output_audio(
-                limited_playback,
-                sr,
-                breath_segments,
-                atten_db=atten_db,
-            )
-        output_path = _build_output_path(input_path)
-
-        return {
-            "source_audio": analysis_audio,
-            "limited_source_audio": limited_plot,
-            "limited_playback_audio": limited_playback,
-            "output_audio": y_processed_plot,
-            "output_display_audio": y_processed_plot,
-            "source_playback_audio": playback_audio,
-            "output_playback_audio": y_processed_playback,
-            "sr": sr,
-            "segments": breath_segments,
-            "auto_segments": list(breath_segments),
-            "diagnostics": diagnostics,
-            "output_path": str(output_path),
-            "output_timeline_segments": output_timeline_segments,
-            "output_headroom_gain": output_headroom_gain,
-        }
-    except Exception as exc:
-        raise RuntimeError(f"处理失败：{exc}") from exc
 
 
 class ColorButton(tk.Label):
@@ -2020,7 +112,7 @@ class BreathReducerApp:
         self.root.title(f"吸气声弱化工具 v{VERSION}")
         self.root.geometry(f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
         self.root.resizable(True, True)
-        self.app_config = _load_app_config()
+        self.app_config = load_app_config()
 
         self.input_path = ""
         self.output_path = ""
@@ -2414,7 +506,7 @@ class BreathReducerApp:
             self.selected_time_sec = previous_selected_time
         self.active_plot = previous_active_plot
 
-        self.debug_text.set(_format_diagnostics_text(self.last_diagnostics, len(self.segments)))
+        self.debug_text.set(format_diagnostics_text(self.last_diagnostics, len(self.segments)))
         self._save_current_config()
         self._set_busy(False, "状态：处理完成，当前显示为内存输出；点击“导出”才会写入磁盘", "green")
         self._update_selection_buttons()
@@ -2507,10 +599,22 @@ class BreathReducerApp:
                     self.file_label.config(text=rollback_label[0], foreground=rollback_label[1])
                 else:
                     self.file_label.config(text=os.path.basename(rollback_path), foreground="green")
+                self.status_label.config(
+                    text=f"状态：处理失败，已恢复为 {os.path.basename(rollback_path)}",
+                    foreground="red",
+                )
             elif self.loaded_input_path:
                 self.input_path = self.loaded_input_path
                 self.file_label.config(text=os.path.basename(self.loaded_input_path), foreground="green")
-            messagebox.showerror("错误", str(error))
+                self.status_label.config(
+                    text=f"状态：处理失败，仍使用 {os.path.basename(self.loaded_input_path)}",
+                    foreground="red",
+                )
+            else:
+                self.input_path = ""
+                self.file_label.config(text="未选择文件", foreground="gray")
+                self.status_label.config(text="状态：处理失败，未加载有效文件", foreground="red")
+            messagebox.showerror("错误", f"处理失败：{error}")
 
         self._run_bg_job(
             work,
@@ -2805,7 +909,7 @@ class BreathReducerApp:
         if self.is_busy:
             return
 
-        _event_log(f"PRESS  plot={plot_kind} x={event.xdata} half={self.half_time_mode} resize_pending={self.pending_resize_index} resize_active={self.resize_segment_index}")
+        event_log(f"PRESS  plot={plot_kind} x={event.xdata} half={self.half_time_mode} resize_pending={self.pending_resize_index} resize_active={self.resize_segment_index}")
 
         # ── 减半模式：press 进入时立即关闭模式，然后原子处理本次点击 ──
         if self.half_time_mode:
@@ -2900,7 +1004,7 @@ class BreathReducerApp:
         if self.half_time_mode or self._half_time_consumed:
             return
 
-        _event_log(f"MOTION plot={plot_kind} x={event.xdata:.3f} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
+        event_log(f"MOTION plot={plot_kind} x={event.xdata:.3f} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
 
         # ── pending → active resize 提升 ──
         if self.pending_resize_index is not None and self.pending_resize_press_time is not None:
@@ -2946,7 +1050,7 @@ class BreathReducerApp:
             self.drag_plot_kind = None
             return
 
-        _event_log(f"RELEASE plot={plot_kind} x={event.xdata} half={self.half_time_mode} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
+        event_log(f"RELEASE plot={plot_kind} x={event.xdata} half={self.half_time_mode} pending={self.pending_resize_index} active_resize={self.resize_segment_index}")
 
         # ── 减半模式的 press 已消费本次点击：release 直接跳过所有逻辑 ──
         if self._half_time_consumed:
@@ -3208,10 +1312,10 @@ class BreathReducerApp:
 
         if self._segment_is_half_time(start_sec, end_sec):
             # Cancel half-time on any overlapping portion of this effective segment.
-            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(start_sec, end_sec)])
+            self.half_time_ranges = subtract_time_ranges(self.half_time_ranges, [(start_sec, end_sec)])
             action_text = "已取消"
         else:
-            self.half_time_ranges = _merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
+            self.half_time_ranges = merge_time_ranges(self.half_time_ranges + [(start_sec, end_sec)], min_gap_sec=0.0)
             action_text = "已设为"
 
         self.selected_segment_index = best_index
@@ -3235,15 +1339,15 @@ class BreathReducerApp:
             "left_append_ms": float(self.left_append_ms_var.get() or 0),
             "right_append_ms": float(self.right_append_ms_var.get() or 0),
         }
-        _save_app_config(self.app_config)
+        save_app_config(self.app_config)
 
     def _segment_is_half_time(self, start_sec, end_sec):
         if self.sr is None:
             return False
         start_sample = int(round(float(start_sec) * self.sr))
         end_sample = int(round(float(end_sec) * self.sr))
-        half_samples = _time_ranges_to_samples(self.half_time_ranges, self.sr, max(end_sample, 1))
-        return _is_half_time_sample_segment(start_sample, end_sample, half_samples, self.sr)
+        half_samples = time_ranges_to_samples(self.half_time_ranges, self.sr, max(end_sample, 1))
+        return is_half_time_sample_segment(start_sample, end_sample, half_samples, self.sr)
 
     def _normalize_half_time_ranges(self):
         """Keep half-time ranges clipped to current effective segments (intersection, not exact match)."""
@@ -3258,22 +1362,22 @@ class BreathReducerApp:
                 overlap_end = min(float(half_end), float(seg_end))
                 if overlap_end > overlap_start:
                     clipped.append((overlap_start, overlap_end))
-        self.half_time_ranges = _merge_time_ranges(clipped, min_gap_sec=0.0)
+        self.half_time_ranges = merge_time_ranges(clipped, min_gap_sec=0.0)
 
     def _compute_rewrite_outputs(self, segments, half_time_ranges, atten_db, base_source, base_playback, sr, source_len):
         """CPU-heavy rewrite path; safe to call off the UI thread with snapshots."""
-        half_time_segments = _time_ranges_to_samples(half_time_ranges, sr, source_len)
-        output_audio, timeline = _render_output_audio(
+        half_time_segments = time_ranges_to_samples(half_time_ranges, sr, source_len)
+        output_audio, timeline = render_output_audio(
             base_source,
             sr,
             segments,
             atten_db=atten_db,
             half_time_segments=half_time_segments,
         )
-        if _audio_buffers_share_content(base_source, base_playback):
+        if audio_buffers_share_content(base_source, base_playback):
             output_playback = output_audio
         else:
-            output_playback, _ = _render_output_audio(
+            output_playback, _ = render_output_audio(
                 base_playback,
                 sr,
                 segments,
@@ -3377,7 +1481,7 @@ class BreathReducerApp:
 
         def worker():
             try:
-                actual_audio, _ = _load_actual_output_audio(output_file)
+                actual_audio, _ = load_actual_output_audio(output_file)
             except Exception:
                 return
 
@@ -3416,7 +1520,7 @@ class BreathReducerApp:
 
         export_playback = np.asarray(self.output_playback_audio, dtype=np.float32)
         export_input_path = self.loaded_input_path
-        self.output_path = str(_build_output_path(export_input_path))
+        self.output_path = str(build_output_path(export_input_path))
         output_file = Path(self.output_path)
         sr = self.sr
 
@@ -3425,7 +1529,7 @@ class BreathReducerApp:
             try:
                 if temp_out.exists():
                     temp_out.unlink()
-                _write_output_mp3(export_playback, sr, temp_out, bitrate_kbps=bitrate_kbps)
+                write_output_mp3(export_playback, sr, temp_out, bitrate_kbps=bitrate_kbps)
                 temp_out.replace(output_file)
                 return str(output_file)
             except Exception:
@@ -3590,8 +1694,8 @@ class BreathReducerApp:
     def _rebuild_effective_segments(self, rewrite_output=True, async_rewrite=True, status_on_done=None):
         if self.source_audio is None or self.sr is None:
             return
-        effective_ranges = _merge_time_ranges(self.auto_segments + self.manual_segments, min_gap_sec=0.002)
-        self.segments = _time_ranges_to_samples(effective_ranges, self.sr, len(self.source_audio))
+        effective_ranges = merge_time_ranges(self.auto_segments + self.manual_segments, min_gap_sec=0.002)
+        self.segments = time_ranges_to_samples(effective_ranges, self.sr, len(self.source_audio))
         self._normalize_half_time_ranges()
 
         if self.selected_segment_index is not None and self.selected_segment_index >= len(self.segments):
@@ -3639,7 +1743,7 @@ class BreathReducerApp:
         return best
 
     def _replace_effective_segments(self, ranges_sec, status_on_done=None):
-        merged = _merge_time_ranges(ranges_sec, min_gap_sec=0.002)
+        merged = merge_time_ranges(ranges_sec, min_gap_sec=0.002)
         self.auto_segments = list(merged)
         self.manual_segments = []
         self.segments_dirty = True
@@ -3682,7 +1786,7 @@ class BreathReducerApp:
             mapped_e = new_start + r1 * new_len
             if mapped_e > mapped_s:
                 remapped.append((mapped_s, mapped_e))
-        self.half_time_ranges = _merge_time_ranges(kept + remapped, min_gap_sec=0.0)
+        self.half_time_ranges = merge_time_ranges(kept + remapped, min_gap_sec=0.0)
 
     def _apply_segment_resize(self, segment_index, edge, new_time_sec):
         if self.is_busy or self.sr is None or not (0 <= segment_index < len(self.segments)):
@@ -3716,7 +1820,7 @@ class BreathReducerApp:
     def _apply_range_edit(self, start_sec, end_sec):
         edit_range = (float(start_sec), float(end_sec))
         if self.range_edit_mode == "add":
-            self.manual_segments = _merge_time_ranges(self.manual_segments + [edit_range], min_gap_sec=0.002)
+            self.manual_segments = merge_time_ranges(self.manual_segments + [edit_range], min_gap_sec=0.002)
             self.segments_dirty = True
             self._rebuild_effective_segments(
                 rewrite_output=True,
@@ -3745,7 +1849,7 @@ class BreathReducerApp:
                 item for item in effective_ranges
                 if not (abs(item[0] - removed_start) < 1e-6 and abs(item[1] - removed_end) < 1e-6)
             ]
-            self.half_time_ranges = _subtract_time_ranges(self.half_time_ranges, [(removed_start, removed_end)])
+            self.half_time_ranges = subtract_time_ranges(self.half_time_ranges, [(removed_start, removed_end)])
             self.segments_dirty = True
             self._replace_effective_segments(
                 effective_ranges,

@@ -18,6 +18,8 @@ python3 -m venv .venv
 
 ## 吸气声弱化工具
 
+DSP 已拆到 `breath/` 包（`detect` / `render` / `limit` / `io` / `segments`）；GUI 入口仍是：
+
 ```bash
 .venv/bin/python breath_reduce_mac.py
 ```
