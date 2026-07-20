@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib import rcParams
 
-VERSION = 62
+VERSION = 63
 HOP_LENGTH = 512
 LEFT_APPEND_MS = 20.0
 RIGHT_APPEND_MS = 0.0
@@ -2475,61 +2475,49 @@ class BreathReducerApp:
         input_path = self.input_path
         atten_db = self.atten_slider.get()
         sensitivity = self.sensitivity_slider.get()
-        token = self._bump_op_token()
-        self._set_busy(True, "状态：正在识别并生成内存预览...", "orange", busy_token=token)
 
-        def worker():
-            try:
-                result = process_breath(
-                    input_path,
-                    atten_db,
-                    sensitivity,
-                    peak_reject_threshold,
-                    percentile_reject_threshold,
-                    voice_floor_threshold,
-                    left_append_ms,
-                    right_append_ms,
-                    min_segment_length_ms,
-                )
-                error = None
-            except Exception as exc:
-                result = None
-                error = exc
+        def work():
+            return process_breath(
+                input_path,
+                atten_db,
+                sensitivity,
+                peak_reject_threshold,
+                percentile_reject_threshold,
+                voice_floor_threshold,
+                left_append_ms,
+                right_append_ms,
+                min_segment_length_ms,
+            )
 
-            def apply():
-                if token != self.op_token:
-                    # Superseded: only release busy if we still own it.
-                    self._release_busy_if_token(token)
-                    return
-                if error is not None:
-                    # Roll path back to last successful load so export cannot mix names.
-                    if rollback_path:
-                        self.input_path = rollback_path
-                        if rollback_label:
-                            self.file_label.config(text=rollback_label[0], foreground=rollback_label[1])
-                        else:
-                            self.file_label.config(text=os.path.basename(rollback_path), foreground="green")
-                    elif self.loaded_input_path:
-                        self.input_path = self.loaded_input_path
-                        self.file_label.config(text=os.path.basename(self.loaded_input_path), foreground="green")
-                    self._release_busy_if_token(token, "状态：处理失败", "red")
-                    messagebox.showerror("错误", str(error))
-                    return
-                self._apply_process_result(
-                    result,
-                    previous_selected_time,
-                    previous_view_start,
-                    previous_view_duration,
-                    previous_active_plot,
-                    input_path,
-                )
+        def on_ok(result, token):
+            self._apply_process_result(
+                result,
+                previous_selected_time,
+                previous_view_start,
+                previous_view_duration,
+                previous_active_plot,
+                input_path,
+            )
 
-            try:
-                self.root.after(0, apply)
-            except tk.TclError:
-                pass
+        def on_err(error):
+            # Roll path back to last successful load so export cannot mix names.
+            if rollback_path:
+                self.input_path = rollback_path
+                if rollback_label:
+                    self.file_label.config(text=rollback_label[0], foreground=rollback_label[1])
+                else:
+                    self.file_label.config(text=os.path.basename(rollback_path), foreground="green")
+            elif self.loaded_input_path:
+                self.input_path = self.loaded_input_path
+                self.file_label.config(text=os.path.basename(self.loaded_input_path), foreground="green")
+            messagebox.showerror("错误", str(error))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_bg_job(
+            work,
+            on_ok,
+            on_error=on_err,
+            busy_text="状态：正在识别并生成内存预览...",
+        )
         return True
 
     def _compute_envelope(self, audio):
@@ -2648,12 +2636,24 @@ class BreathReducerApp:
         merged_visible_segments = [(start / self.sr, end / self.sr) for start, end in self.segments]
 
         for index, (start_sec, end_sec) in enumerate(merged_visible_segments):
-            is_half_time = self._segment_is_half_time(start_sec, end_sec)
-            base_fill = "#a855f7" if is_half_time else "#00ff66"
-            edge_color = "#c084fc" if is_half_time else ("#ff7f50" if index in self.picked_detected_segments else "#00cc55")
-            fill_alpha = 0.34 if is_half_time else (0.30 if index == self.selected_segment_index else (0.22 if index in self.picked_detected_segments else 0.18))
+            has_half = self._segment_is_half_time(start_sec, end_sec)
+            edge_color = (
+                "#c084fc" if has_half
+                else ("#ff7f50" if index in self.picked_detected_segments else "#00cc55")
+            )
+            fill_alpha = (
+                0.30 if index == self.selected_segment_index
+                else (0.22 if index in self.picked_detected_segments else 0.18)
+            )
             selected_edge = "#f7ff00" if index == self.selected_segment_index else edge_color
-            ax.axvspan(start_sec, end_sec, color=base_fill, alpha=fill_alpha, ec=selected_edge, lw=2)
+            # Base breath segment always green; half-time overlays only intersecting subranges.
+            ax.axvspan(start_sec, end_sec, color="#00ff66", alpha=fill_alpha, ec=selected_edge, lw=2)
+            if has_half and self.half_time_ranges:
+                for hs, he in self.half_time_ranges:
+                    ov_s = max(float(hs), float(start_sec))
+                    ov_e = min(float(he), float(end_sec))
+                    if ov_e > ov_s:
+                        ax.axvspan(ov_s, ov_e, color="#a855f7", alpha=0.40, ec="#c084fc", lw=1.5)
 
         for start_sec, end_sec in self.selected_ranges:
             ax.axvspan(start_sec, end_sec, color="#5aa9ff", alpha=0.22, ec="#1f6feb", lw=2)
@@ -3419,46 +3419,40 @@ class BreathReducerApp:
         self.output_path = str(_build_output_path(export_input_path))
         output_file = Path(self.output_path)
         sr = self.sr
-        token = self._bump_op_token()
-        self._set_busy(True, "状态：正在导出 MP3...", "orange", busy_token=token)
 
-        def worker():
+        def work():
             temp_out = output_file.with_name(f".{output_file.name}.partial")
             try:
                 if temp_out.exists():
                     temp_out.unlink()
                 _write_output_mp3(export_playback, sr, temp_out, bitrate_kbps=bitrate_kbps)
                 temp_out.replace(output_file)
-                error = None
-            except Exception as exc:
-                error = exc
-                try:
-                    if temp_out.exists():
+                return str(output_file)
+            except Exception:
+                if temp_out.exists():
+                    try:
                         temp_out.unlink()
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
+                raise
 
-            def apply():
-                if token != self.op_token:
-                    self._release_busy_if_token(token)
-                    return
-                if error is not None:
-                    self._release_busy_if_token(token, "状态：导出失败", "red")
-                    messagebox.showerror("错误", str(error))
-                    return
-                self._release_busy_if_token(
-                    token,
-                    f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
-                    "green",
-                )
-                self._schedule_actual_output_refresh(output_file, parent_token=token)
+        def on_ok(result, token):
+            self._release_busy_if_token(
+                token,
+                f"状态：已导出 {os.path.basename(self.output_path)}，真实 MP3 图谱将在空闲时刷新",
+                "green",
+            )
+            self._schedule_actual_output_refresh(output_file, parent_token=token)
 
-            try:
-                self.root.after(0, apply)
-            except tk.TclError:
-                pass
+        def on_err(error):
+            messagebox.showerror("错误", str(error))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._run_bg_job(
+            work,
+            on_ok,
+            on_error=on_err,
+            busy_text="状态：正在导出 MP3...",
+        )
 
     def export_effective_segments(self):
         if self.sr is None or not self.segments:
@@ -3470,7 +3464,7 @@ class BreathReducerApp:
         )
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.root.update()
+        self.root.update_idletasks()
         self.status_label.config(text=f"状态：已复制全部处理区间：{text}", foreground="blue")
 
     def toggle_half_time_mode(self):
@@ -3511,7 +3505,7 @@ class BreathReducerApp:
             if text:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(text)
-                self.root.update()
+                self.root.update_idletasks()
                 self.status_label.config(text=f"状态：已复制并清空选区：{text}", foreground="blue")
             else:
                 self.status_label.config(text="状态：当前没有选区可输出", foreground="blue")
@@ -3545,7 +3539,7 @@ class BreathReducerApp:
                 if text:
                     self.root.clipboard_clear()
                     self.root.clipboard_append(text)
-                    self.root.update()
+                    self.root.update_idletasks()
                     self.status_label.config(text=f"状态：已复制所选处理片段到剪贴板：{text}", foreground="purple")
                 else:
                     self.status_label.config(text="状态：未选中任何处理片段", foreground="blue")
@@ -3769,7 +3763,7 @@ class BreathReducerApp:
         text = self.debug_text.get()
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.root.update()
+        self.root.update_idletasks()
         self.status_label.config(text="状态：诊断信息已复制到剪贴板", foreground="blue")
 
     def _stop_player(self):

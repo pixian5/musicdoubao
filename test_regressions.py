@@ -87,13 +87,17 @@ def test_build_target_name_collision_disambiguates():
 
 def test_op_token_exists():
     assert hasattr(m, "VERSION")
-    assert m.VERSION >= 62
+    assert m.VERSION >= 63
     assert hasattr(m.BreathReducerApp, "_bump_op_token")
     assert hasattr(m.BreathReducerApp, "_release_busy_if_token")
     assert hasattr(m.BreathReducerApp, "_map_half_time_on_resize")
     assert hasattr(m.BreathReducerApp, "_run_bg_job")
     assert hasattr(m, "_audio_buffers_share_content")
     assert hasattr(m, "DEFAULT_DETECT_PARAMS")
+    # process/export/rewrite should all go through the unified job helper
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    assert "def work():\n            return process_breath" in src or "return process_breath(" in src
+    assert 'busy_text="状态：正在导出 MP3..."' in src
 
 
 def test_mono_buffer_share_and_single_render():
