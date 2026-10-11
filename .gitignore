@@ -11,3 +11,14 @@ dist/
 
 # WorkBuddy 工作目录（项目记忆等，不入库）
 .workbuddy/
+Thumbs.db
+node_modules/
+.idea/
+.vscode/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
