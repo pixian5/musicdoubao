@@ -27,8 +27,13 @@ SPACE_RUN = re.compile(r"\s+")
 MTIME_TOLERANCE_SEC = 2.0
 
 
-def is_m4a_name(name: str) -> bool:
-    return name.lower().endswith(".m4a")
+# 支持的录音文件扩展名：.m4a 为旧版格式，.qta 为较新 macOS 语音备忘录格式
+SUPPORTED_AUDIO_EXTS = (".m4a", ".qta")
+
+
+def is_audio_name(name: str) -> bool:
+    """判断文件名是否为可同步的录音文件（.m4a 或 .qta）。"""
+    return name.lower().endswith(SUPPORTED_AUDIO_EXTS)
 
 
 def sanitize_title(title: str) -> str:
@@ -63,7 +68,7 @@ def load_recordings(db_path: Path) -> list[dict]:
                 ZEVICTIONDATE
             FROM ZCLOUDRECORDING
             WHERE ZPATH IS NOT NULL
-              AND ZPATH LIKE '%.m4a'
+              AND (ZPATH LIKE '%.m4a' OR ZPATH LIKE '%.qta')
             ORDER BY ZDATE, ZPATH
             """
         ).fetchall()
@@ -197,11 +202,11 @@ def build_target_name(
     unique_id: str = "",
     used_names: set[str] | None = None,
 ) -> str:
-    if not is_m4a_name(source_name):
+    if not is_audio_name(source_name):
         raise ValueError(f"只支持同步 .m4a 文件：{source_name}")
     # Always use basename so ZPATH like "2024/foo.m4a" cannot create nested dirs.
     source_base = Path(source_name).name
-    if not is_m4a_name(source_base):
+    if not is_audio_name(source_base):
         raise ValueError(f"只支持同步 .m4a 文件：{source_name}")
     # Sanitize residual path separators that might appear in odd basenames.
     source_base = source_base.replace("/", "_").replace("\\", "_")
@@ -237,7 +242,7 @@ def build_legacy_name_map(recordings: list[dict]) -> dict[str, str]:
     reserved = set()
     reserved_fold = set()
     for item in recordings:
-        if not is_m4a_name(item["source_name"]):
+        if not is_audio_name(item["source_name"]):
             continue
         base = sanitize_title(item["title"])
         candidate = f"{base}.m4a"
@@ -287,8 +292,8 @@ def find_compat_existing_file(
     expected_prefix = sanitize_title(title)
     source_stem = Path(source_name).stem
     date_hint = source_stem.split()[0] if source_stem else ""
-    for candidate in target_dir.glob("*.m4a"):
-        if not candidate.is_file() or not is_m4a_name(candidate.name):
+    for candidate in target_dir.iterdir():
+        if not candidate.is_file() or not is_audio_name(candidate.name):
             continue
         if candidate.name in used_names:
             continue
@@ -314,7 +319,7 @@ def cleanup_name_twins(
     Prefer active folder over 最近删除 when both exist.
     Returns (preferred_path_or_None, conflicts_added).
     """
-    if not target_name or not is_m4a_name(target_name):
+    if not target_name or not is_audio_name(target_name):
         return None, 0
     active = target_dir / target_name
     deleted = recently_deleted_dir / target_name
@@ -358,7 +363,7 @@ def normalize_state_items(raw_state_items: dict) -> dict[str, dict]:
             continue
         effective_source_name = str(item.get("source_name") or source_name)
         target_name = str(item.get("target_name") or "")
-        if not is_m4a_name(effective_source_name) or not is_m4a_name(target_name):
+        if not is_audio_name(effective_source_name) or not is_audio_name(target_name):
             continue
         unique_id = str(item.get("unique_id") or "").strip()
         record_key = build_record_key(unique_id, effective_source_name)
@@ -476,7 +481,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
 
     for item in recordings:
         source_name = item["source_name"]
-        if not is_m4a_name(source_name):
+        if not is_audio_name(source_name):
             continue
         try:
             source_path = resolve_under(recordings_dir, source_name)
@@ -511,7 +516,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
 
         prev_name = prev.get("target_name")
         # Prefer stable previous target name when still free and m4a.
-        if prev_name and is_m4a_name(str(prev_name)) and str(prev_name) not in claimed_existing_names:
+        if prev_name and is_audio_name(str(prev_name)) and str(prev_name) not in claimed_existing_names:
             target_name = str(prev_name)
         else:
             target_name = build_target_name(
@@ -528,7 +533,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         # another recording's file under corrupt/shared state.
         owns_prev_name = (
             bool(prev_name)
-            and is_m4a_name(str(prev_name))
+            and is_audio_name(str(prev_name))
             and (
                 str(prev_name) == target_name
                 or str(prev_name) not in claimed_existing_names
@@ -644,7 +649,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         if record_key in seen_record_keys:
             continue
         target_name = str(item.get("target_name") or "")
-        if not is_m4a_name(target_name):
+        if not is_audio_name(target_name):
             continue
         # Do not trash a file still claimed by a live record this run.
         if target_name in claimed_existing_names:
@@ -661,7 +666,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
     # Final twin cleanup for all managed active names (covers first-sync / no-prev cases).
     for item in next_state_items.values():
         target_name = str(item.get("target_name") or "")
-        if not is_m4a_name(target_name):
+        if not is_audio_name(target_name):
             continue
         _, twin_conflicts = cleanup_name_twins(
             target_dir, recently_deleted_dir, trash_dir, target_name
