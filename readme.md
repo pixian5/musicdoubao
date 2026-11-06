@@ -80,6 +80,7 @@ $VOICE_MEMOS_TARGET_DIR  或  /Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹�
 行为摘要：
 
 - 活跃录音 → 目标目录；系统「最近删除」→ `最近删除/`；从 DB 消失 → `回收站/`
+- `.qta` 录音会额外生成一份 `.m4a`（AAC）便于跨平台播放，原始 `.qta` 保留（转换用 ffmpeg，优先无损复制内部 AAC 流，失败再重编码）
 - 重命名冲突时会把旧目标移入回收站，**不再直接删除**
 - 是否需要更新按 **size + mtime** 判断
 - 状态文件损坏会备份为 `.corrupt-<timestamp>` 后以空状态继续
@@ -93,3 +94,14 @@ $VOICE_MEMOS_TARGET_DIR  或  /Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹�
 ```
 
 `test_regressions.py` 覆盖：重叠渲染长度、半速（精确/模糊/邻接合并/resize 比例映射）、目标文件名清洗与碰撞消歧、路径穿越、缺失源不误删、冲突进回收站、mono 缓冲共享、twin 清理。
+
+## 当前开发进度
+
+语音备忘录同步脚本现已支持 `.m4a` 与 `.qta` 两种录音格式，并为 `.qta` 额外转码出一份 `.m4a`（AAC）便于跨平台播放；项目虚拟环境已改用 `uv` 管理。详见 [docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md](docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md) 与 [docs/20261106-2010-当前开发进度-Hunyuan.md](docs/20261106-2010-当前开发进度-Hunyuan.md)。
+
+## 下一步待实现
+
+- 可选：将同步做成 macOS `launchd` 后台任务，实现开机自动同步（目前需手动 `uv run python sync_voice_memos.py --watch`）。
+- 可选：评估 `.qta` 转码保真度，必要时改用更高码率或保留无损封装。
+
+详见 [docs/20261106-2010-下一步待实现-Hunyuan.md](docs/20261106-2010-下一步待实现-Hunyuan.md)。项目文档索引见 [文档索引.md](文档索引.md)。

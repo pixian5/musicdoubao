@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import sys
 import time
+import subprocess
 from pathlib import Path
 
 
@@ -436,6 +437,44 @@ def atomic_copy2(src: Path, dst: Path) -> None:
                 pass
 
 
+def convert_qta_to_m4a(src: Path, dst: Path) -> bool:
+    """将 .qta 录音转为 .m4a（AAC），便于跨平台播放。
+
+    优先无损复制内部已有的 AAC 音频流；若该方式失败（如内部为专有编码），
+    则回退为重新编码 AAC（192kbps）。原始 .qta 文件不会被改动。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = dst.with_name(f".{dst.name}.partial-{os.getpid()}")
+    # 优先无损复制第一个音频流；失败再重新编码 AAC。
+    # 显式指定输出容器为 mp4（.m4a 即 mp4 子集），避免临时文件扩展名导致 ffmpeg 推断容器失败。
+    strategies = (
+        ["-map", "0:a:0", "-c:a", "copy", "-f", "mp4"],
+        ["-c:a", "aac", "-b:a", "192k", "-f", "mp4"],
+    )
+    last_err = ""
+    for extra in strategies:
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src), *extra, str(temp_path)],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            print("警告：未找到 ffmpeg，无法转换 .qta 录音。", file=sys.stderr)
+            return False
+        if proc.returncode == 0 and temp_path.exists() and temp_path.stat().st_size > 0:
+            temp_path.replace(dst)
+            return True
+        last_err = proc.stderr
+    print(f"警告：.qta 转 .m4a 失败 {src.name}：{last_err[-600:]}", file=sys.stderr)
+    if temp_path.exists():
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+    return False
+
+
 def lookup_prev_state(
     state_items: dict[str, dict],
     source_name_index: dict[str, str],
@@ -476,6 +515,8 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
     skipped = 0
     trashed = 0
     conflicts = 0
+    converted = 0
+    convert_failed = 0
     missing_sources = []
     rejected_paths = []
 
@@ -635,6 +676,17 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
                     copied += 1
 
         claimed_existing_names.add(target_name)
+
+        # 为 .qta 源额外生成一份 .m4a，便于跨平台播放（原始 .qta 仍保留）
+        if source_path.suffix.lower() == ".qta":
+            m4a_name = Path(target_name).stem + ".m4a"
+            m4a_path = current_dir / m4a_name
+            if not m4a_path.exists():
+                if convert_qta_to_m4a(source_path, m4a_path):
+                    converted += 1
+                else:
+                    convert_failed += 1
+
         next_state_items[record_key] = {
             "title": title,
             "target_name": target_name,
@@ -683,6 +735,8 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
         "skipped": skipped,
         "trashed": trashed,
         "conflicts": conflicts,
+        "converted": converted,
+        "convert_failed": convert_failed,
         "missing_sources": missing_sources,
         "rejected_paths": rejected_paths,
         "state_path": str(state_path),
@@ -733,6 +787,8 @@ def main() -> int:
                         "conflicts": result["conflicts"],
                         "missing_sources": len(result["missing_sources"]),
                         "rejected_paths": len(result["rejected_paths"]),
+                        "converted": result["converted"],
+                        "convert_failed": result["convert_failed"],
                         "target_dir": result["target_dir"],
                         "state_path": result["state_path"],
                     },
