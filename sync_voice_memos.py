@@ -31,6 +31,11 @@ MTIME_TOLERANCE_SEC = 2.0
 # 支持的录音文件扩展名：.m4a 为旧版格式，.qta 为较新 macOS 语音备忘录格式
 SUPPORTED_AUDIO_EXTS = (".m4a", ".qta")
 
+# 是否同时把原始 .qta 文件也同步到输出目录。
+# 默认 False：只输出转码后的 .m4a（跨平台可播放），不再写入原始 .qta。
+# 如需保留原始 .qta，可设环境变量 VOICE_MEMOS_KEEP_QTA=1，或用 --keep-qta 参数。
+KEEP_QTA_ORIGINAL = os.environ.get("VOICE_MEMOS_KEEP_QTA", "").strip() in ("1", "true", "yes", "on")
+
 
 def is_audio_name(name: str) -> bool:
     """判断文件名是否为可同步的录音文件（.m4a 或 .qta）。"""
@@ -495,7 +500,13 @@ def lookup_prev_state(
     return prev or {}
 
 
-def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path: Path) -> dict:
+def sync_once(
+    recordings_dir: Path,
+    db_path: Path,
+    target_dir: Path,
+    state_path: Path,
+    keep_qta: bool = KEEP_QTA_ORIGINAL,
+) -> dict:
     target_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(state_path)
     raw_state_items = state.setdefault("items", {})
@@ -530,6 +541,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
             rejected_paths.append(source_name)
             continue
 
+        source_is_qta = source_path.suffix.lower() == ".qta"
+        # 默认只输出转码后的 .m4a：.qta 录音不再写入原始 .qta 文件。
+        output_m4a_only = source_is_qta and not keep_qta
+
         unique_id = item["unique_id"]
         record_key = build_record_key(unique_id, source_name)
         title = item["title"]
@@ -556,6 +571,10 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
             continue
 
         prev_name = prev.get("target_name")
+        # m4a-only 模式下，旧状态中以 .qta 命名的条目不再作为 rename 依据：
+        # 改为重新生成 .m4a 主输出，原始 .qta 由下方统一清理（移入回收站）。
+        if output_m4a_only and prev_name and str(prev_name).lower().endswith(".qta"):
+            prev_name = None
         # Prefer stable previous target name when still free and m4a.
         if prev_name and is_audio_name(str(prev_name)) and str(prev_name) not in claimed_existing_names:
             target_name = str(prev_name)
@@ -568,6 +587,11 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
             )
         current_dir = recently_deleted_dir if is_recently_deleted else target_dir
         target_path = current_dir / target_name
+
+        # m4a-only 模式下，把主输出扩展名统一为 .m4a（去掉原始 .qta 命名）。
+        if output_m4a_only and not target_name.lower().endswith(".m4a"):
+            target_name = Path(target_name).stem + ".m4a"
+            target_path = current_dir / target_name
 
         # Only rename from prev_name when this record still exclusively owns that name
         # (not already claimed by an earlier record this run). Prevents stealing
@@ -607,7 +631,7 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
                         renamed += 1
                         conflicts += 1
 
-        if not prev_name and not target_path.exists():
+        if not output_m4a_only and not prev_name and not target_path.exists():
             legacy_name = legacy_name_map.get(source_name)
             compat_path = None
             if legacy_name:
@@ -650,35 +674,60 @@ def sync_once(recordings_dir: Path, db_path: Path, target_dir: Path, state_path:
             )
             target_path = current_dir / target_name
 
-        if not target_path.exists():
-            atomic_copy2(source_path, target_path)
-            copied += 1
-        else:
-            if same_recording(source_path, target_path):
-                skipped += 1
-            else:
-                # Different content at this path: if we own it via prev, refresh;
-                # otherwise pick a free name to avoid clobbering another recording.
-                owns_path = bool(prev_name and str(prev_name) == target_name)
-                if owns_path:
-                    atomic_copy2(source_path, target_path)
-                    copied += 1
+        # 重新解名后再次确保 m4a-only 扩展名正确。
+        if output_m4a_only and not target_name.lower().endswith(".m4a"):
+            target_name = Path(target_name).stem + ".m4a"
+            target_path = current_dir / target_name
+
+        if output_m4a_only:
+            # .qta 在 m4a-only 模式下以转码后的 .m4a 为主输出；已存在且非空即视为完成。
+            if (not target_path.exists()) or (target_path.stat().st_size == 0):
+                if convert_qta_to_m4a(source_path, target_path):
+                    converted += 1
                 else:
-                    alt_name = build_target_name(
-                        title,
-                        source_name,
-                        unique_id=unique_id or record_key,
-                        used_names=claimed_existing_names | {target_name},
-                    )
-                    target_name = alt_name
-                    target_path = current_dir / target_name
-                    atomic_copy2(source_path, target_path)
-                    copied += 1
+                    convert_failed += 1
+            else:
+                skipped += 1
+        else:
+            if not target_path.exists():
+                atomic_copy2(source_path, target_path)
+                copied += 1
+            else:
+                if same_recording(source_path, target_path):
+                    skipped += 1
+                else:
+                    # Different content at this path: if we own it via prev, refresh;
+                    # otherwise pick a free name to avoid clobbering another recording.
+                    owns_path = bool(prev_name and str(prev_name) == target_name)
+                    if owns_path:
+                        atomic_copy2(source_path, target_path)
+                        copied += 1
+                    else:
+                        alt_name = build_target_name(
+                            title,
+                            source_name,
+                            unique_id=unique_id or record_key,
+                            used_names=claimed_existing_names | {target_name},
+                        )
+                        target_name = alt_name
+                        target_path = current_dir / target_name
+                        atomic_copy2(source_path, target_path)
+                        copied += 1
 
         claimed_existing_names.add(target_name)
 
-        # 为 .qta 源额外生成一份 .m4a，便于跨平台播放（原始 .qta 仍保留）
-        if source_path.suffix.lower() == ".qta":
+        # m4a-only 模式（默认）：主输出已是 .m4a，无需额外处理；
+        # 并把本次已成功生成 .m4a 后残留的原始 .qta 移入回收站（安全移除，非真正删除）。
+        if output_m4a_only and target_path.exists() and target_path.stat().st_size > 0:
+            qta_name = Path(target_name).stem + ".qta"
+            for _d in (target_dir, recently_deleted_dir):
+                qta_path = _d / qta_name
+                if qta_path.exists() and qta_path.resolve() != target_path.resolve():
+                    move_to_trash(qta_path, trash_dir)
+                    trashed += 1
+
+        # 仅当显式保留原始 .qta 时（KEEP_QTA_ORIGINAL），主输出为 .qta 并额外补一份 .m4a。
+        if source_is_qta and keep_qta:
             m4a_name = Path(target_name).stem + ".m4a"
             m4a_path = current_dir / m4a_name
             if not m4a_path.exists():
@@ -757,6 +806,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--state-path", type=Path, default=None)
     parser.add_argument("--watch", action="store_true", help="持续轮询同步。")
+    parser.add_argument(
+        "--keep-qta",
+        action="store_true",
+        help="保留原始 .qta 文件（默认只输出转码后的 .m4a）。",
+    )
     parser.add_argument("--interval", type=float, default=30.0, help="轮询间隔秒数，默认 30。")
     return parser.parse_args()
 
@@ -775,7 +829,13 @@ def main() -> int:
     while True:
         try:
             with StateLock(lock_path):
-                result = sync_once(args.recordings_dir, args.db_path, args.target_dir, state_path)
+                result = sync_once(
+                    args.recordings_dir,
+                    args.db_path,
+                    args.target_dir,
+                    state_path,
+                    keep_qta=args.keep_qta,
+                )
             print(
                 json.dumps(
                     {

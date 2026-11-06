@@ -80,7 +80,8 @@ $VOICE_MEMOS_TARGET_DIR  或  /Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹�
 行为摘要：
 
 - 活跃录音 → 目标目录；系统「最近删除」→ `最近删除/`；从 DB 消失 → `回收站/`
-- `.qta` 录音会额外生成一份 `.m4a`（AAC）便于跨平台播放，原始 `.qta` 保留（转换用 ffmpeg，优先无损复制内部 AAC 流，失败再重编码）
+- **默认只输出 `.m4a`**：`.qta` 录音转码为 `.m4a`（AAC）后作为主输出写入目标目录，原始 `.qta` 不再写入（本机原件始终保留）。转码用 ffmpeg，优先无损复制内部 AAC 流，失败再重编码
+- 若需同时保留原始 `.qta`，用 `--keep-qta` 参数或环境变量 `VOICE_MEMOS_KEEP_QTA=1` 打开（此时 `.qta` 为主输出、额外补一份 `.m4a`）
 - 重命名冲突时会把旧目标移入回收站，**不再直接删除**
 - 是否需要更新按 **size + mtime** 判断
 - 状态文件损坏会备份为 `.corrupt-<timestamp>` 后以空状态继续
@@ -97,7 +98,7 @@ $VOICE_MEMOS_TARGET_DIR  或  /Users/x/Library/CloudStorage/Dropbox-Sbbz/dqg苹�
 
 ## 当前开发进度
 
-语音备忘录同步脚本现已支持 `.m4a` 与 `.qta` 两种录音格式，并为 `.qta` 额外转码出一份 `.m4a`（AAC）便于跨平台播放；项目虚拟环境已改用 `uv` 管理。详见 [docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md](docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md) 与 [docs/20261106-2010-当前开发进度-Hunyuan.md](docs/20261106-2010-当前开发进度-Hunyuan.md)。
+语音备忘录同步脚本现已支持 `.m4a` 与 `.qta` 两种录音格式，并默认**只输出转码后的 `.m4a`**（`.qta` 不再写入目标，本机原件保留）；项目虚拟环境已改用 `uv` 管理。详见 [docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md](docs/20261106-1916-同步脚本支持qta格式修复-Hunyuan.md)、[docs/20261106-2028-同步默认只输出m4a-Hunyuan.md](docs/20261106-2028-同步默认只输出m4a-Hunyuan.md) 与 [docs/20261106-2010-当前开发进度-Hunyuan.md](docs/20261106-2010-当前开发进度-Hunyuan.md)。
 
 ## 下一步待实现
 
